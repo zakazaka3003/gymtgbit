@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, WebAppInfo
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +31,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "gym_bot.db")
 PADDLE_USE_GPU = os.getenv("PADDLE_USE_GPU", "0") == "1"
 TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()  # https-URL мини-приложения
 
 if TESSERACT_CMD:
     try:
@@ -139,23 +140,42 @@ class WorkoutFSM(StatesGroup):
 # UI helpers
 # -------------------------
 def main_menu_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Главный экран"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="📄 Замеры (InBody)"), KeyboardButton(text="💪 Силовые")],
-            [KeyboardButton(text="🏋️ Тренировка (дневник)"), KeyboardButton(text="📈 Аналитика")],
-            [KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True
-    )
+    rows = [
+        [KeyboardButton(text="📊 Главный экран"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="📄 Замеры (InBody)"), KeyboardButton(text="💪 Силовые")],
+        [KeyboardButton(text="🏋️ Тренировка (дневник)"), KeyboardButton(text="📈 Аналитика")],
+        [KeyboardButton(text="⚙️ Настройки")],
+    ]
+    if WEBAPP_URL:
+        rows.insert(0, [KeyboardButton(
+            text="🚀 Открыть приложение",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def webapp_inline_kb():
+    """Инлайн-клавиатура с кнопкой запуска mini app под дашбордом."""
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL)),
+    ]])
 
 
 def dashboard_inline_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="dashboard_refresh")],
-        [InlineKeyboardButton(text="➕ Замер", callback_data="inbody_add"),
-         InlineKeyboardButton(text="🏋️ Тренировка", callback_data="workout_start")],
+    rows = []
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton(
+            text="🚀 Открыть приложение",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="dashboard_refresh")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Замер", callback_data="inbody_add"),
+        InlineKeyboardButton(text="🏋️ Тренировка", callback_data="workout_start"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_to_menu_inline():
