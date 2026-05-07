@@ -1,0 +1,15 @@
+aiogram==3.6.0
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+
+matplotlib==3.9.0
+numpy==1.26.4
+
+opencv-python==4.6.0.66
+Pillow==10.4.0
+
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+
+pytesseract==0.3.10
+regex==2024.5.15
