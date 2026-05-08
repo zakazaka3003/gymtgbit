@@ -42,6 +42,8 @@ except Exception:
 # ----------------------------------------------------------------------------
 # Допускаем «79. 3», «79 ,3», «79.3», «79,3».
 _NUM_RE = re.compile(r"\d{1,4}(?:\s*[.,]\s*\d{1,3})?")
+# Только дробные числа — игнорируем целые tick-метки на bar-chart.
+_DEC_NUM_RE = re.compile(r"\d{1,3}\s*[.,]\s*\d{1,2}")
 
 
 def _to_float(s: str) -> Optional[float]:
@@ -54,6 +56,25 @@ def _to_float(s: str) -> Optional[float]:
 
 def _numbers_in(s: str):
     return [v for v in (_to_float(m.group(0)) for m in _NUM_RE.finditer(s)) if v is not None]
+
+
+def _decimals_in(s: str):
+    return [v for v in (_to_float(m.group(0)) for m in _DEC_NUM_RE.finditer(s)) if v is not None]
+
+
+# Tesseract на печатной кириллице регулярно подсовывает латиницу-двойник
+# (M, a, c, e, o, p, x, y, B, H, K, T, ...). Делаем безопасный мапинг
+# для матчинга подписей: исходный текст в логи мы храним, для regex —
+# нормализованный.
+_LAT2CYR = str.maketrans({
+    "M": "М", "a": "а", "c": "с", "e": "е", "o": "о", "p": "р",
+    "x": "х", "y": "у", "B": "В", "H": "Н", "K": "К", "T": "Т",
+    "P": "Р", "C": "С", "A": "А", "E": "Е", "O": "О", "X": "Х", "Y": "У",
+})
+
+
+def _normalize_cyr(s: str) -> str:
+    return s.translate(_LAT2CYR)
 
 
 # ----------------------------------------------------------------------------
@@ -123,16 +144,17 @@ _W_VAR = r"(?:вес|bес|bec|вeс|вес|wec|wес|bеc|ьес|нес)"
 _VES_VAR = r"(?:[вbBв][ея][ес][ея]?|[bB][ea][cз])"
 
 _LABEL_PATTERNS = {
-    # «Идеальный Вес» (правый верхний блок), допускаем мусор в окончании и в "Вес"
+    # «Идеальный Вес» (правый верхний блок).
     "ideal_weight": re.compile(
-        r"идеальн\w*\s*[вbB][ея][ес][ея]?",
+        r"идеальн\w*\s*в\w{1,3}",
         re.IGNORECASE | re.UNICODE,
     ),
     # Иногда Tesseract схлопывает в одно слово: «Ипеальыйвее»
     "ideal_weight_glued": re.compile(
-        r"и[пнт]еа[лр]ь?ны\w*\s*[вbB]\w{0,3}",
+        r"и[пнт]еа[лр]ь?ны\w*\s*в\w{0,3}",
         re.IGNORECASE | re.UNICODE,
     ),
+    # «Процентное содержание жира»
     "pbf_full": re.compile(
         r"процент\w*\s+содерж\w*\s+жир",
         re.IGNORECASE | re.UNICODE,
@@ -142,13 +164,21 @@ _LABEL_PATTERNS = {
         r"содерж\w*\s+жир",
         re.IGNORECASE | re.UNICODE,
     ),
+    # «Масса/Массы скелетной мускулатуры» — после нормализации латиницы
+    # «Maces» превращается в «Мaceс/Масеs»; ловим по «мас… скел…».
     "smm_full": re.compile(
-        r"(масс|месс|нес)\w*\s*скел[еe]тн",
+        r"мас\w*\s*скел[еeё]тн",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Мускулатуры» отдельно — иногда подпись разорвана, и значение лежит
+    # на строке с «мускулатуры …».
+    "smm_continuation": re.compile(
+        r"мускулатур",
         re.IGNORECASE | re.UNICODE,
     ),
     # «Вес (kg)» в истории — короткая подпись
     "weight_short": re.compile(
-        r"^\s*\W*(вес|bес|bec)\W*(kg|кг)\W*$",
+        r"^\s*\W*(вес)\W*(kg|кг)\W*",
         re.IGNORECASE | re.UNICODE,
     ),
 }
@@ -185,56 +215,85 @@ def parse_inbody_text(text: str):
             metrics[metric] = round(float(value), 1)
             debug[metric] = {"source": source, "label": label_text}
 
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    # Нормализованная и оригинальная версия — пара (norm, orig).
+    pairs = [(_normalize_cyr(ln), ln) for ln in raw_lines]
 
-    # Проход 1 — приоритетные якоря
-    for ln in lines:
+    def _scan_value(idx: int, after_text: str, prefer_decimals: bool = True,
+                     min_value: float = 0.0, lookahead: int = 2):
+        """Ищем подходящее число: сначала на этой строке после якоря,
+        затем — в следующих lookahead строках полностью.
+        prefer_decimals=True — игнорируем целые числа (бар-чарт tick'и)."""
+        # на текущей строке
+        nums = _decimals_in(after_text) if prefer_decimals else _numbers_in(after_text)
+        cand = [n for n in nums if n >= min_value]
+        if cand:
+            return cand[0], "same_line"
+        # в lookahead-строках
+        for j in range(idx + 1, min(len(pairs), idx + 1 + lookahead)):
+            nums = _decimals_in(pairs[j][1])
+            cand = [n for n in nums if n >= min_value]
+            if cand:
+                return cand[0], f"next+{j-idx}"
+        return None, None
+
+    # Проход 1 — приоритетные якоря (по нормализованному тексту)
+    for i, (norm, orig) in enumerate(pairs):
         # weight: «Идеальный Вес 79.3 kg»
         if "weight_kg" not in metrics:
-            m = _LABEL_PATTERNS["ideal_weight"].search(ln) or _LABEL_PATTERNS["ideal_weight_glued"].search(ln)
+            m = _LABEL_PATTERNS["ideal_weight"].search(norm) or _LABEL_PATTERNS["ideal_weight_glued"].search(norm)
             if m:
-                # берём первое число с разделителем (.,) — приоритет «реальное значение»
-                nums = _numbers_in(ln[m.end():])
-                # фильтруем малозначащие: control_weight 0.0 идёт ниже,
-                # но «Идеальный Вес» — заведомо большое число.
+                # после якоря — обычное (не только дробное) число ≥30
+                nums = _numbers_in(orig[m.end():])
                 cand = [n for n in nums if n >= 30.0]
                 if cand:
-                    try_set("weight_kg", cand[0], "anchor:ideal", ln.strip())
+                    try_set("weight_kg", cand[0], "anchor:ideal", orig.strip())
 
         if "pbf_percent" not in metrics:
-            m = _LABEL_PATTERNS["pbf_full"].search(ln)
+            m = _LABEL_PATTERNS["pbf_full"].search(norm)
             if m:
-                nums = _numbers_in(ln[m.end():])
-                if nums:
-                    try_set("pbf_percent", nums[0], "anchor:pbf_full", ln.strip())
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=2.0)
+                if v is not None:
+                    try_set("pbf_percent", v, f"anchor:pbf_full({src})", orig.strip())
 
         if "smm_kg" not in metrics:
-            m = _LABEL_PATTERNS["smm_full"].search(ln)
+            m = _LABEL_PATTERNS["smm_full"].search(norm)
             if m:
-                nums = _numbers_in(ln[m.end():])
-                if nums:
-                    try_set("smm_kg", nums[0], "anchor:smm_full", ln.strip())
+                # значение почти всегда на следующей строке — пропускаем tick'и
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=10.0)
+                if v is not None:
+                    try_set("smm_kg", v, f"anchor:smm_full({src})", orig.strip())
+
+    # Проход 1.5 — если SMM не нашли, ищем по «мускулатуры»: на этой же строке
+    # должно быть дробное число.
+    if "smm_kg" not in metrics:
+        for i, (norm, orig) in enumerate(pairs):
+            m = _LABEL_PATTERNS["smm_continuation"].search(norm)
+            if m:
+                nums = _decimals_in(orig)
+                cand = [n for n in nums if 10.0 <= n <= 80.0]
+                if cand:
+                    try_set("smm_kg", cand[0], "anchor:smm_cont", orig.strip())
+                    if "smm_kg" in metrics:
+                        break
 
     # Проход 2 — генерики по таблице «История состава тела»:
-    # короткие строки «(kg) 79.3» / «(kg) 41.7» рядом с подписью.
-    # InBody печатает их вертикально, поэтому ищем сочетания подписи на одной
-    # строке с числом, либо подпись на следующей строке после "(kg)".
+    # короткие строки «Вес (kg) 79.3» / «(kg) 41.7».
     if "weight_kg" not in metrics:
-        for ln in lines:
-            if _LABEL_PATTERNS["weight_short"].search(ln):
-                nums = _numbers_in(ln)
-                cand = [n for n in nums if n >= 30.0]
-                if cand:
-                    try_set("weight_kg", cand[0], "generic:weight_short", ln.strip())
+        for i, (norm, orig) in enumerate(pairs):
+            if _LABEL_PATTERNS["weight_short"].search(norm):
+                v, src = _scan_value(i, orig, prefer_decimals=False, min_value=30.0)
+                if v is not None:
+                    try_set("weight_kg", v, f"generic:weight_short({src})", orig.strip())
                     break
 
     if "pbf_percent" not in metrics:
-        for ln in lines:
-            m = _LABEL_PATTERNS["pbf_short"].search(ln)
+        for i, (norm, orig) in enumerate(pairs):
+            m = _LABEL_PATTERNS["pbf_short"].search(norm)
             if m:
-                nums = _numbers_in(ln[m.end():])
-                if nums:
-                    try_set("pbf_percent", nums[0], "generic:pbf_short", ln.strip())
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=2.0)
+                if v is not None:
+                    try_set("pbf_percent", v, f"generic:pbf_short({src})", orig.strip())
                     if "pbf_percent" in metrics:
                         break
 
