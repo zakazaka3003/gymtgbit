@@ -23,6 +23,7 @@ services:
       PADDLE_USE_GPU: 0
     volumes:
       - app_data:/data
+      - paddle_cache:/root/.paddleocr
 
   backend:
     build:
