@@ -81,21 +81,22 @@ def _deskew(img_bgr: np.ndarray) -> np.ndarray:
 
 
 def _preprocess_variants(img_bgr: np.ndarray):
-    """Готовим 2 варианта изображения для Tesseract."""
-    base = _deskew(img_bgr)
+    """Готовим 2 варианта изображения для Tesseract.
 
-    # 1) оригинал в RGB (PIL ждёт RGB-каналы)
-    yield "orig", cv2.cvtColor(base, cv2.COLOR_BGR2RGB)
+    ВАЖНО: НЕ ДЕЛАЕМ deskew. На реальных InBody-фото он чаще всего ломает OCR
+    (после нашего теста — превращает чистый текст в мусор), потому что ищет
+    угол по плотным колонкам/строкам таблицы и крутит на ~ доли градуса.
+    Печатные отчёты приходят выровненными, и Tesseract сам толерантен к небольшим
+    отклонениям.
+    """
+    # 1) raw RGB (PIL ждёт RGB-каналы)
+    yield "orig", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    # 2) upscale ×2 + denoise + CLAHE + sharpen
-    h, w = base.shape[:2]
-    up = cv2.resize(base, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC) if max(h, w) < 1800 else base.copy()
-    g = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    g = cv2.fastNlMeansDenoising(g, None, 10, 7, 21)
-    g = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(g)
-    sharpen_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    g = cv2.filter2D(g, -1, sharpen_k)
-    yield "upscaled", g  # одноканальный grayscale, PIL переварит
+    # 2) upscale ×2 без агрессивных фильтров — иногда помогает на низком DPI.
+    h, w = img_bgr.shape[:2]
+    if max(h, w) < 1800:
+        up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        yield "upscaled", cv2.cvtColor(up, cv2.COLOR_BGR2RGB)
 
 
 # ----------------------------------------------------------------------------
