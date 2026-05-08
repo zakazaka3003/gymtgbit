@@ -245,7 +245,7 @@ def _fmt_delta(v: Optional[float], digits: int = 1) -> str:
 def _fmt_metric_line(emoji: str, label: str, cur: Optional[float],
                      d7: Optional[float], d30: Optional[float], unit: str) -> str:
     cur_s = _fmt_value(cur, 1, f" {unit}".rstrip())
-    parts = [f"{emoji} {label}: *{cur_s}*"]
+    parts = [f"{emoji} {label}: <b>{cur_s}</b>"]
     bits = []
     if d7 is not None:
         bits.append(f"7д{_fmt_delta(d7)}")
@@ -257,16 +257,16 @@ def _fmt_metric_line(emoji: str, label: str, cur: Optional[float],
 
 
 def format_dashboard(data: DashboardData, profile: Optional[dict]) -> str:
-    """Рендерим карточку в Markdown (aiogram parse_mode='Markdown')."""
+    """Рендерим карточку в HTML (aiogram parse_mode='HTML')."""
     if data.last_inbody is None and data.workouts_last_30d == 0:
         return (
-            "📊 *Состояние тела*\n\n"
+            "📊 <b>Состояние тела</b>\n\n"
             "Замеров и тренировок пока нет.\n\n"
             "Начни с замера InBody — фото или вручную.\n"
             "Затем добавь первую тренировку — и здесь появится твоя динамика."
         )
 
-    lines = ["📊 *Состояние тела*"]
+    lines = ["📊 <b>Состояние тела</b>"]
 
     if data.last_inbody is not None:
         last = data.last_inbody
@@ -284,24 +284,24 @@ def format_dashboard(data: DashboardData, profile: Optional[dict]) -> str:
 
         if data.days_since_last_inbody is not None:
             if data.days_since_last_inbody == 0:
-                lines.append("_замер сегодня_")
+                lines.append("<i>замер сегодня</i>")
             else:
-                lines.append(f"_замер {data.days_since_last_inbody} дн. назад_")
+                lines.append(f"<i>замер {data.days_since_last_inbody} дн. назад</i>")
     else:
         lines.append("")
         lines.append("Замеров InBody пока нет — добавь первый.")
 
     lines.append("")
-    lines.append(f"🏋️ За 7 дней: *{data.workouts_last_7d}* трен. · "
-                 f"тоннаж *{int(round(data.tonnage_last_7d))}* кг")
-    lines.append(f"🗓 За 30 дней: *{data.workouts_last_30d}* трен.")
+    lines.append(f"🏋️ За 7 дней: <b>{data.workouts_last_7d}</b> трен. · "
+                 f"тоннаж <b>{int(round(data.tonnage_last_7d))}</b> кг")
+    lines.append(f"🗓 За 30 дней: <b>{data.workouts_last_30d}</b> трен.")
     if data.streak_weeks >= 2:
-        lines.append(f"🔥 Серия: *{data.streak_weeks}* недель подряд")
+        lines.append(f"🔥 Серия: <b>{data.streak_weeks}</b> недель подряд")
 
     insights = interpret(data, profile)
     if insights:
         lines.append("")
-        lines.append("🧠 *Анализ:*")
+        lines.append("🧠 <b>Анализ:</b>")
         for s in insights:
             lines.append(f"• {s}")
 
