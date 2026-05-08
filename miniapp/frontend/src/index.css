@@ -1,0 +1,89 @@
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 1.25rem;
+
+    /* Light theme */
+    --bg: 250 250 251;            /* zinc-50 */
+    --surface: 255 255 255;
+    --surface-2: 244 244 245;     /* zinc-100 */
+    --border: 228 228 231;        /* zinc-200 */
+    --fg: 24 24 27;               /* zinc-900 */
+    --fg-muted: 113 113 122;      /* zinc-500 */
+    --accent: 16 185 129;         /* emerald-500 */
+    --accent-fg: 6 95 70;         /* emerald-800 */
+    --warn: 234 179 8;            /* amber-500 */
+    --danger: 239 68 68;          /* red-500 */
+  }
+
+  .dark {
+    --bg: 9 9 11;                 /* zinc-950 */
+    --surface: 24 24 27;          /* zinc-900 */
+    --surface-2: 39 39 42;        /* zinc-800 */
+    --border: 39 39 42;
+    --fg: 244 244 245;            /* zinc-100 */
+    --fg-muted: 161 161 170;      /* zinc-400 */
+    --accent: 52 211 153;         /* emerald-400 */
+    --accent-fg: 209 250 229;     /* emerald-100 */
+    --warn: 250 204 21;
+    --danger: 248 113 113;
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    background-color: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: 'Geist', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overscroll-behavior: none;
+  }
+  .font-mono {
+    font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+}
+
+@layer utilities {
+  .surface {
+    background-color: rgb(var(--surface));
+    border: 1px solid rgb(var(--border));
+  }
+  .surface-2 {
+    background-color: rgb(var(--surface-2));
+  }
+  .text-muted {
+    color: rgb(var(--fg-muted));
+  }
+  .text-accent {
+    color: rgb(var(--accent));
+  }
+  .bg-accent {
+    background-color: rgb(var(--accent));
+  }
+  .border-default {
+    border-color: rgb(var(--border));
+  }
+  /* убрать дефолтный outline, мы рисуем свой через ring */
+  *:focus { outline: none; }
+}
+
+/* hide scrollbar inside horizontal scrollers */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Telegram WebApp safe-area */
+.safe-bottom {
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 0.5rem);
+}
+.safe-top {
+  padding-top: calc(env(safe-area-inset-top, 0px) + 0.5rem);
+}
+

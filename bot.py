@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+    InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, WebAppInfo
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from dashboard import fetch_dashboard_data, format_dashboard
 from ocr_utils import run_inbody_ocr
 
 
@@ -30,6 +31,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "gym_bot.db")
 PADDLE_USE_GPU = os.getenv("PADDLE_USE_GPU", "0") == "1"
 TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()  # https-URL мини-приложения
 
 if TESSERACT_CMD:
     try:
@@ -138,14 +140,42 @@ class WorkoutFSM(StatesGroup):
 # UI helpers
 # -------------------------
 def main_menu_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📄 Замеры (InBody)")],
-            [KeyboardButton(text="💪 Силовые"), KeyboardButton(text="🏋️ Тренировка (дневник)")],
-            [KeyboardButton(text="📈 Аналитика"), KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True
-    )
+    rows = [
+        [KeyboardButton(text="📊 Главный экран"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="📄 Замеры (InBody)"), KeyboardButton(text="💪 Силовые")],
+        [KeyboardButton(text="🏋️ Тренировка (дневник)"), KeyboardButton(text="📈 Аналитика")],
+        [KeyboardButton(text="⚙️ Настройки")],
+    ]
+    if WEBAPP_URL:
+        rows.insert(0, [KeyboardButton(
+            text="🚀 Открыть приложение",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def webapp_inline_kb():
+    """Инлайн-клавиатура с кнопкой запуска mini app под дашбордом."""
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=WEBAPP_URL)),
+    ]])
+
+
+def dashboard_inline_kb():
+    rows = []
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton(
+            text="🚀 Открыть приложение",
+            web_app=WebAppInfo(url=WEBAPP_URL),
+        )])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="dashboard_refresh")])
+    rows.append([
+        InlineKeyboardButton(text="➕ Замер", callback_data="inbody_add"),
+        InlineKeyboardButton(text="🏋️ Тренировка", callback_data="workout_start"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_to_menu_inline():
@@ -664,6 +694,16 @@ dp = Dispatcher()
 # -------------------------
 # Start / Main menu
 # -------------------------
+async def _send_dashboard(target, tg_id: int):
+    """Отрисовать дашборд. ``target`` — это Message (для answer)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, tg_id)
+        profile = await db_get_profile(db, user_id)
+        data = await fetch_dashboard_data(db, user_id)
+    text = format_dashboard(data, profile)
+    await target.answer(text, parse_mode="Markdown", reply_markup=dashboard_inline_kb())
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -689,12 +729,41 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("Пол:", reply_markup=kb)
     else:
         await message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+        await _send_dashboard(message, message.from_user.id)
+
+
+@dp.message(Command("dashboard"))
+async def cmd_dashboard(message: Message, state: FSMContext):
+    await state.clear()
+    await _send_dashboard(message, message.from_user.id)
+
+
+@dp.message(F.text == "📊 Главный экран")
+async def open_dashboard(message: Message, state: FSMContext):
+    await state.clear()
+    await _send_dashboard(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "dashboard_refresh")
+async def dashboard_refresh(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        profile = await db_get_profile(db, user_id)
+        data = await fetch_dashboard_data(db, user_id)
+    text = format_dashboard(data, profile)
+    try:
+        await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=dashboard_inline_kb())
+    except Exception:
+        # старое сообщение нельзя отредактировать — пришлём новое
+        await cb.message.answer(text, parse_mode="Markdown", reply_markup=dashboard_inline_kb())
+    await cb.answer("Обновлено")
 
 
 @dp.callback_query(F.data == "go_main_menu")
 async def go_main_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.answer("🏠 Главное меню", reply_markup=main_menu_kb())
+    await _send_dashboard(cb.message, cb.from_user.id)
     await cb.answer()
 
 
