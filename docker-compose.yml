@@ -1,0 +1,66 @@
+# Self-hosted gymtgbit: bot + miniapp (backend + frontend) под Caddy с auto-TLS.
+#
+# Перед запуском:
+#   1) Скопировать .env.example → .env, заполнить DOMAIN и BOT_TOKEN.
+#   2) Открыть на VPS порты 80/443 (ufw allow 80,443).
+#   3) DNS A-запись DOMAIN → IP VPS.
+#   4) docker compose up -d --build
+#
+# Caddy сам выпустит Let's Encrypt сертификат при первом запуске.
+# Бот и mini-app разделяют один SQLite-файл /data/gym_bot.db.
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DB_PATH: /data/gym_bot.db
+      WEBAPP_URL: https://${DOMAIN}
+      TESSERACT_CMD: /usr/bin/tesseract
+      PADDLE_USE_GPU: 0
+    volumes:
+      - app_data:/data
+
+  backend:
+    build:
+      context: ./miniapp/backend
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DEV_MODE: ${DEV_MODE:-0}
+      DB_PATH: /data/gym_bot.db
+    volumes:
+      - app_data:/data
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./miniapp/frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:

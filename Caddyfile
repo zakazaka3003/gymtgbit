@@ -1,0 +1,26 @@
+# Caddy: TLS termination + reverse-proxy.
+#   /api/*    → backend (FastAPI на :8000)
+#   /healthz  → backend
+#   всё остальное → frontend (nginx со статикой Vite-сборки)
+
+{$DOMAIN} {
+    encode zstd gzip
+
+    @api {
+        path /api/* /healthz
+    }
+    handle @api {
+        reverse_proxy backend:8000
+    }
+
+    handle {
+        reverse_proxy frontend:80
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer-when-downgrade"
+        -Server
+    }
+}
