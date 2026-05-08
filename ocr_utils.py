@@ -62,6 +62,67 @@ def _decimals_in(s: str):
     return [v for v in (_to_float(m.group(0)) for m in _DEC_NUM_RE.finditer(s)) if v is not None]
 
 
+# ----------------------------------------------------------------------------
+# Date detection
+# ----------------------------------------------------------------------------
+# InBody печатает «2026.03.15. 11:17». Также встречаются варианты:
+#   2026-03-15, 2026/03/15, 15.03.2026, 15-03-2026, 15/03/2026, 03/15/2026.
+_DATE_PATTERNS = [
+    # YYYY?.?MM?.?DD (InBody — основной)
+    (re.compile(r"(20\d{2})[.\-/](0?[1-9]|1[0-2])[.\-/]([0-2]?\d|3[01])"), "ymd"),
+    # DD.MM.YYYY (русский формат)
+    (re.compile(r"([0-2]?\d|3[01])[.\-/](0?[1-9]|1[0-2])[.\-/](20\d{2})"), "dmy"),
+]
+
+
+def _try_extract_date(text: str) -> Optional[str]:
+    """Возвращает дату в формате YYYY-MM-DD или None.
+
+    Стратегия: сканируем построчно, отдаём первое совпадение, отдавая приоритет
+    строкам, содержащим слова «дата» / «проверк» / «test» — чтобы не схватить
+    случайные числа из таблицы.
+    """
+    import datetime as _dt
+
+    def _validate(y: int, m: int, d: int) -> Optional[str]:
+        try:
+            iso = _dt.date(y, m, d).isoformat()
+        except Exception:
+            return None
+        # отбрасываем невменяемые годы
+        if y < 2010 or y > 2100:
+            return None
+        return iso
+
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    candidates = []  # (priority_score, iso_date)
+
+    for ln in raw_lines:
+        norm = _normalize_cyr(ln).lower()
+        # Мини-эвристика: рядом с подписью «Дата проверки» или «Test Date» —
+        # очень вероятно искомая дата.
+        priority = 0
+        if "дата" in norm or "провер" in norm or "test" in norm or "date" in norm:
+            priority = 10
+
+        for pat, kind in _DATE_PATTERNS:
+            for mt in pat.finditer(ln):
+                a, b, c = mt.group(1), mt.group(2), mt.group(3)
+                if kind == "ymd":
+                    iso = _validate(int(a), int(b), int(c))
+                else:  # dmy
+                    iso = _validate(int(c), int(b), int(a))
+                if iso:
+                    candidates.append((priority, iso, ln.strip()))
+
+    if not candidates:
+        return None
+
+    # сортируем: сначала строки с подсказками («Дата»…), потом по порядку появления
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0][1]
+
+
 # Tesseract на печатной кириллице регулярно подсовывает латиницу-двойник
 # (M, a, c, e, o, p, x, y, B, H, K, T, ...). Делаем безопасный мапинг
 # для матчинга подписей: исходный текст в логи мы храним, для regex —
@@ -347,10 +408,24 @@ def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
                 conf += 0.04
     conf = round(min(1.0, conf), 2)
 
+    # Дата печатается в шапке отчёта — пытаемся вытащить из лучшего варианта,
+    # а также из всех вариантов, если в основном дата не нашлась.
+    test_date = _try_extract_date(best["raw"] or "")
+    if not test_date:
+        # fallback: ещё раз прогнать orig PSM=6 — он лучше для шапки
+        for vname, imgv in _preprocess_variants(img_bgr):
+            if vname != "orig":
+                continue
+            txt = _tesseract_text(imgv, psm=6)
+            test_date = _try_extract_date(txt)
+            if test_date:
+                break
+
     return {
         "ok": True,
         "metrics": metrics,
         "confidence": conf,
+        "test_date": test_date,
         "raw_text": (best["raw"] or "")[:4000],
         "debug": {
             "variant": best["variant"],

@@ -133,6 +133,7 @@ class InBodyFSM(StatesGroup):
     ocr_edit_weight = State()
     ocr_edit_pbf = State()
     ocr_edit_smm = State()
+    ocr_edit_date = State()
 
 
 class StrengthFSM(StatesGroup):
@@ -323,7 +324,8 @@ def wipe_confirm_inline() -> InlineKeyboardMarkup:
 
 def ocr_confirm_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("✅ Сохранить", "ocr_save", style="success"), btn("✏️ Исправить", "ocr_edit")],
+        [btn("✅ Сохранить", "ocr_save", style="success"), btn("✏️ Цифры", "ocr_edit")],
+        [btn("📅 Изменить дату", "ocr_edit_date")],
         [btn("❌ Отмена", "ocr_cancel", style="danger")],
     ])
 
@@ -1345,20 +1347,24 @@ async def inbody_photo_received(message: Message, state: FSMContext):
     metrics = ocr.get("metrics", {})
     confidence = float(ocr.get("confidence", 0.0))
     raw_text = ocr.get("raw_text", "")
+    ocr_date = ocr.get("test_date")
 
-    # default date today
-    record_date = today_ymd()
+    # дата по умолчанию — то, что распознано на фото; если не нашли — сегодня
+    record_date = ocr_date or today_ymd()
+    date_from_ocr = bool(ocr_date)
 
     await state.update_data(
         ocr_metrics=metrics,
         ocr_confidence=confidence,
         ocr_raw=raw_text,
         ocr_date=record_date,
+        ocr_date_from_ocr=date_from_ocr,
     )
 
+    date_hint = "<i>с фото</i>" if date_from_ocr else "<i>сегодня (не нашли на фото)</i>"
     card = (
         "📷 <b>Распознано</b>\n"
-        f"Дата: <b>{H(record_date)}</b>\n"
+        f"Дата: <b>{H(record_date)}</b> {date_hint}\n"
         f"Вес: <b>{H(metrics.get('weight_kg','—'))}</b> кг\n"
         f"Жир: <b>{H(metrics.get('pbf_percent','—'))}</b> %\n"
         f"Мышцы: <b>{H(metrics.get('smm_kg','—'))}</b> кг\n\n"
@@ -1398,6 +1404,65 @@ async def ocr_edit(cb: CallbackQuery, state: FSMContext):
         reply_markup=cancel_fsm_inline(),
     )
     await cb.answer()
+
+
+def _parse_user_date(s: str) -> Optional[str]:
+    """Принимаем YYYY-MM-DD, YYYY.MM.DD, DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY.
+    Возвращаем YYYY-MM-DD или None."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    fmts = ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d",
+            "%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y")
+    for f in fmts:
+        try:
+            d = dt.datetime.strptime(s, f).date()
+            if d.year < 2010 or d.year > 2100:
+                return None
+            return d.isoformat()
+        except Exception:
+            continue
+    return None
+
+
+@dp.callback_query(InBodyFSM.ocr_confirm, F.data == "ocr_edit_date")
+async def ocr_edit_date_start(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cur = data.get("ocr_date", today_ymd())
+    await state.set_state(InBodyFSM.ocr_edit_date)
+    await cb.message.answer(
+        f"📅 <b>Изменить дату</b>\n\n"
+        f"Текущая: <b>{H(cur)}</b>\n"
+        f"Введи новую дату — форматы: <code>2026-03-15</code>, "
+        f"<code>2026.03.15</code> или <code>15.03.2026</code>.",
+        reply_markup=cancel_fsm_inline(),
+    )
+    await cb.answer()
+
+
+@dp.message(InBodyFSM.ocr_edit_date)
+async def ocr_edit_date_input(message: Message, state: FSMContext):
+    iso = _parse_user_date(message.text or "")
+    if iso is None:
+        await message.answer(
+            "Не получилось разобрать дату. Пример: <code>2026-03-15</code> или <code>15.03.2026</code>.",
+            reply_markup=cancel_fsm_inline(),
+        )
+        return
+    await state.update_data(ocr_date=iso, ocr_date_from_ocr=False)
+    data = await state.get_data()
+    metrics = data.get("ocr_metrics", {})
+    confidence = float(data.get("ocr_confidence", 0.0))
+    await state.set_state(InBodyFSM.ocr_confirm)
+    card = (
+        "📷 <b>Обновлено</b>\n"
+        f"Дата: <b>{H(iso)}</b> <i>(вручную)</i>\n"
+        f"Вес: <b>{H(metrics.get('weight_kg','—'))}</b> кг\n"
+        f"Жир: <b>{H(metrics.get('pbf_percent','—'))}</b> %\n"
+        f"Мышцы: <b>{H(metrics.get('smm_kg','—'))}</b> кг\n\n"
+        f"<i>Confidence: <b>{int(confidence*100)}%</b></i>"
+    )
+    await message.answer(card, reply_markup=ocr_confirm_inline())
 
 
 @dp.message(InBodyFSM.ocr_edit_weight)
