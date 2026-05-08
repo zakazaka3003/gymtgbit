@@ -1,84 +1,74 @@
+"""OCR для InBody-распечаток.
+
+Рерайт под русские распечатки (InBody570 и т.п.):
+- PaddleOCR с русской моделью (`lang="ru"`) — читает и кириллицу, и латиницу с цифрами.
+- Используем bounding boxes: каждая надпись OCR — это (text, [x1,y1,x2,y2], conf).
+  Числа сопоставляются с подписями **по координатам** (на той же строке, либо ближайшее справа/снизу).
+- InBody-специфичные «якоря» с приоритетом:
+    «Идеальный Вес N kg» → weight
+    «Процентное содержание жира … N» → pbf
+    «Масса скелетной мускулатуры … N» → smm
+- Generic-fallback (по синонимам подписей) и numeric-fallback (диапазоны) — только если якоря не сработали.
+- Только 2 preprocessing-варианта (orig + upscale×2 + sharpen) чтобы не тратить минуты.
+"""
+
 import os
 import re
-import math
+from dataclasses import dataclass
+from typing import Optional
+
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
 
 try:
     from paddleocr import PaddleOCR
 except Exception:
     PaddleOCR = None
 
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
+
+# ----------------------------------------------------------------------------
+# OCR item
+# ----------------------------------------------------------------------------
+@dataclass
+class OcrItem:
+    text: str
+    cx: float          # центр bbox по X
+    cy: float          # центр bbox по Y
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    conf: float
+
+    @property
+    def h(self) -> float:
+        return max(1.0, self.y2 - self.y1)
 
 
-_METRIC_SYNONYMS = {
-    "weight": [
-        r"\bweight\b", r"\bвес\b",
-    ],
-    "pbf": [
-        r"\bpbf\b", r"\bbody\s*fat\b", r"\bfat\b",
-        r"\bжир\b", r"\bжировая\s*масса\b", r"\bжировая\b",
-    ],
-    "smm": [
-        r"\bsmm\b", r"\bskeletal\s*muscle\b", r"\bmuscle\b",
-        r"\bмышц", r"\bмышечная\s*масса\b",
-    ],
-}
-
-FLOAT_RE = r"(\d{1,3}(?:[.,]\d{1,2})?)"
+_NUM_RE = re.compile(r"[-+]?\d{1,4}(?:[.,]\d{1,3})?")
 
 
-def _to_float(x: str):
-    x = x.strip().replace(" ", "").replace(",", ".")
+def _to_float(s: str) -> Optional[float]:
+    s = s.strip().replace(",", ".").replace(" ", "")
     try:
-        return float(x)
+        return float(s)
     except Exception:
         return None
 
 
-def _safe_crop_document(img_bgr: np.ndarray):
-    """Попытка вырезать лист/рамку по контурам."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
-    )
-    thr_inv = 255 - thr
-
-    contours, _ = cv2.findContours(thr_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return img_bgr
-
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    h, w = gray.shape[:2]
-
-    for c in contours[:5]:
-        area = cv2.contourArea(c)
-        if area < 0.25 * (w * h):
-            continue
-        rect = cv2.minAreaRect(c)
-        box = cv2.boxPoints(rect)
-        box = np.int0(box)
-
-        x, y, bw, bh = cv2.boundingRect(box)
-        pad = int(0.02 * max(w, h))
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(w, x + bw + pad)
-        y1 = min(h, y + bh + pad)
-        crop = img_bgr[y0:y1, x0:x1]
-        if crop.size > 0:
-            return crop
-    return img_bgr
+def _extract_numbers(text: str):
+    out = []
+    for m in _NUM_RE.finditer(text):
+        v = _to_float(m.group(0))
+        if v is not None:
+            out.append(v)
+    return out
 
 
-def _deskew(img_bgr: np.ndarray):
-    """Deskew: оцениваем угол наклона по минимальному прямоугольнику текста."""
+# ----------------------------------------------------------------------------
+# Preprocessing
+# ----------------------------------------------------------------------------
+def _deskew(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -94,246 +84,274 @@ def _deskew(img_bgr: np.ndarray):
         angle = -(90 + angle)
     else:
         angle = -angle
-
     if abs(angle) < 0.3:
         return img_bgr
 
-    (h, w) = img_bgr.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(
-        img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-    )
-    return rotated
-
-
-def _clahe(gray: np.ndarray):
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-def _sharpen(img: np.ndarray):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    return cv2.filter2D(img, -1, kernel)
+    h, w = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
 def _preprocess_variants(img_bgr: np.ndarray):
-    """Готовим несколько вариантов изображения (pipeline)."""
-    variants = []
+    """Только 2 варианта: оригинал + upscale×2 sharpen. Хватает для InBody, экономит ~50% времени."""
+    base = _deskew(img_bgr)
+    yield "orig", base
 
-    # base: auto-rotate + crop
-    img = _deskew(img_bgr)
-    img = _safe_crop_document(img)
-
-    variants.append(("orig", img))
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # attempt 2: CLAHE + adaptive threshold + morphology
-    g2 = _clahe(gray)
-    thr = cv2.adaptiveThreshold(
-        g2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
-    )
-    thr = cv2.medianBlur(thr, 3)
-    kernel = np.ones((2, 2), np.uint8)
-    thr = cv2.dilate(thr, kernel, iterations=1)
-    thr = cv2.erode(thr, kernel, iterations=1)
-    variants.append(("thr", cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)))
-
-    # attempt 3: upscale + sharpen + denoise
-    scale = 2
-    up = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    up_gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    up_gray = cv2.fastNlMeansDenoising(up_gray, None, 15, 7, 21)
-    up_gray = _clahe(up_gray)
-    up_gray = _sharpen(up_gray)
-    thr2 = cv2.threshold(up_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    variants.append(("up_sharp", cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR)))
-
-    # attempt 4: more aggressive upscale x3
-    scale = 3
-    up3 = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    up3 = cv2.fastNlMeansDenoisingColored(up3, None, 10, 10, 7, 21)
-    up3g = cv2.cvtColor(up3, cv2.COLOR_BGR2GRAY)
-    up3g = _clahe(up3g)
-    thr3 = cv2.adaptiveThreshold(
-        up3g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 9
-    )
-    thr3 = _sharpen(thr3)
-    variants.append(("up3_aggr", cv2.cvtColor(thr3, cv2.COLOR_GRAY2BGR)))
-
-    return variants
+    h, w = base.shape[:2]
+    if max(h, w) < 1800:
+        up = cv2.resize(base, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    else:
+        up = base.copy()
+    g = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    g = cv2.fastNlMeansDenoising(g, None, 10, 7, 21)
+    g = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(g)
+    sharpen_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    g = cv2.filter2D(g, -1, sharpen_k)
+    yield "upscaled", cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
 
 
-def _paddle_ocr_text(ocr, img_bgr: np.ndarray):
-    """Вернуть text из PaddleOCR."""
+# ----------------------------------------------------------------------------
+# OCR runner
+# ----------------------------------------------------------------------------
+def _run_paddle(ocr, img_bgr: np.ndarray):
+    """Возвращает list[OcrItem]."""
     try:
         res = ocr.ocr(img_bgr, cls=True)
-        lines = []
-        for block in res:
-            for item in block:
-                txt = item[1][0]
-                if txt:
-                    lines.append(txt)
-        return "\n".join(lines)
     except Exception:
-        return ""
+        return []
+    items: list[OcrItem] = []
+    if not res:
+        return items
+    for block in res:
+        if not block:
+            continue
+        for entry in block:
+            try:
+                box = entry[0]   # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                txt, conf = entry[1]
+                xs = [p[0] for p in box]
+                ys = [p[1] for p in box]
+                items.append(OcrItem(
+                    text=txt,
+                    cx=float(sum(xs) / 4.0),
+                    cy=float(sum(ys) / 4.0),
+                    x1=float(min(xs)),
+                    y1=float(min(ys)),
+                    x2=float(max(xs)),
+                    y2=float(max(ys)),
+                    conf=float(conf),
+                ))
+            except Exception:
+                continue
+    return items
 
 
-def _tesseract_text(img_bgr: np.ndarray):
-    if pytesseract is None:
-        return ""
-    # tesseract любит RGB/PIL
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
-    try:
-        config = r"--oem 3 --psm 6"
-        return pytesseract.image_to_string(pil, lang="eng+rus", config=config)
-    except Exception:
-        try:
-            # fallback eng only
-            return pytesseract.image_to_string(pil, lang="eng", config=r"--oem 3 --psm 6")
-        except Exception:
-            return ""
+# ----------------------------------------------------------------------------
+# Spatial matchers
+# ----------------------------------------------------------------------------
+def _same_row(a: OcrItem, b: OcrItem, tol_ratio: float = 0.5) -> bool:
+    """Соседние items на одной строке: вертикальное перекрытие ≥ tol_ratio."""
+    overlap = min(a.y2, b.y2) - max(a.y1, b.y1)
+    return overlap > 0 and overlap / min(a.h, b.h) >= tol_ratio
 
 
-def parse_inbody_metrics(text: str):
+def _find_first_number_in(item: OcrItem) -> Optional[float]:
+    nums = _extract_numbers(item.text)
+    return nums[0] if nums else None
+
+
+def _find_value_for_label(label: OcrItem, items) -> Optional[float]:
     """
-    Парсер устойчивый к шуму.
-    Возвращает dict: weight_kg, pbf_percent, smm_kg + score.
+    Для подписи `label` ищем числовое значение:
+      1) в самой подписи (вдруг распознали в одну строку)
+      2) на той же строке справа от подписи (ближайший item с цифрой)
+      3) ниже подписи в той же колонке (для 2-строчных карточек)
     """
-    raw = text or ""
-    t = raw.lower()
-    t = t.replace("—", "-")
+    n = _find_first_number_in(label)
+    if n is not None:
+        return n
 
-    found = {}
+    same_row = [
+        it for it in items
+        if it is not label and _same_row(label, it) and it.cx > label.cx
+    ]
+    same_row.sort(key=lambda it: it.cx)
+    for it in same_row:
+        n = _find_first_number_in(it)
+        if n is not None:
+            return n
 
-    def find_metric(metric_key):
-        patterns = _METRIC_SYNONYMS[metric_key]
-        for p in patterns:
-            # допускаем мусор между словом и числом
-            rx = re.compile(p + r".{0,25}?" + FLOAT_RE, re.IGNORECASE | re.DOTALL)
-            m = rx.search(t)
-            if m:
-                val = _to_float(m.group(1))
-                if val is not None:
-                    return val
+    label_w = max(1.0, label.x2 - label.x1)
+    below = [
+        it for it in items
+        if it is not label
+        and it.cy > label.y2
+        and abs(it.cx - label.cx) < label_w
+        and (it.cy - label.y2) < 4 * label.h
+    ]
+    below.sort(key=lambda it: it.cy)
+    for it in below:
+        n = _find_first_number_in(it)
+        if n is not None:
+            return n
+
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Anchored parsing (InBody-specific)
+# ----------------------------------------------------------------------------
+_LABEL_PATTERNS = {
+    # высокий приоритет — точные InBody-подписи
+    "weight_ideal":   re.compile(r"идеальн\w*\s*вес", re.IGNORECASE),
+    "weight_control": re.compile(r"контрол\w*\s*вес", re.IGNORECASE),
+    "pbf_percent":    re.compile(r"процентн\w*\s*содержани\w*\s*жира", re.IGNORECASE),
+    "smm_full":       re.compile(r"масс\w*\s*скелетн\w*\s*мускулатур\w*", re.IGNORECASE),
+    # generic fallback
+    "weight_any":     re.compile(r"^\s*вес\s*\(?(kg|кг)?\)?\s*$", re.IGNORECASE),
+}
+
+_RANGE = {
+    "weight_kg":   (30.0, 250.0),
+    "smm_kg":      (10.0, 80.0),
+    "pbf_percent": (3.0, 60.0),
+}
+
+
+def _in_range(metric: str, value: float) -> bool:
+    lo, hi = _RANGE[metric]
+    return lo <= value <= hi
+
+
+def parse_inbody_items(items):
+    """
+    Возвращает (metrics, debug):
+      metrics: dict с возможными ключами weight_kg, pbf_percent, smm_kg
+      debug:   {metric: {"source": "anchor"|"generic", "label": str}}
+    """
+    metrics: dict[str, float] = {}
+    debug: dict[str, dict] = {}
+
+    def try_set(metric: str, value, source: str, label_text: str):
+        if value is None:
+            return
+        if not _in_range(metric, float(value)):
+            return
+        if metric not in metrics:
+            metrics[metric] = round(float(value), 1)
+            debug[metric] = {"source": source, "label": label_text}
+
+    # 1) Высокоприоритетные InBody-якоря
+    for it in items:
+        t = it.text
+        if "weight_kg" not in metrics and _LABEL_PATTERNS["weight_ideal"].search(t):
+            try_set("weight_kg", _find_value_for_label(it, items), "anchor", t)
+        if "pbf_percent" not in metrics and _LABEL_PATTERNS["pbf_percent"].search(t):
+            try_set("pbf_percent", _find_value_for_label(it, items), "anchor", t)
+        if "smm_kg" not in metrics and _LABEL_PATTERNS["smm_full"].search(t):
+            try_set("smm_kg", _find_value_for_label(it, items), "anchor", t)
+
+    # 1b) «Контроль Веса» как запасной якорь — но только если идеального не было
+    if "weight_kg" not in metrics:
+        for it in items:
+            if _LABEL_PATTERNS["weight_control"].search(it.text):
+                v = _find_value_for_label(it, items)
+                if v is not None and v >= 30.0:
+                    try_set("weight_kg", v, "anchor", it.text)
+                    break
+
+    # 2) Generic — по коротким подписям «Вес»
+    if "weight_kg" not in metrics:
+        for it in items:
+            if _LABEL_PATTERNS["weight_any"].search(it.text):
+                try_set("weight_kg", _find_value_for_label(it, items), "generic", it.text)
+                if "weight_kg" in metrics:
+                    break
+
+    return metrics, debug
+
+
+# ----------------------------------------------------------------------------
+# Main entry
+# ----------------------------------------------------------------------------
+_PADDLE_INSTANCE = None
+
+
+def _get_paddle(use_gpu: bool = False):
+    """Singleton — иначе каждый запуск инициализирует модели по 30+ сек."""
+    global _PADDLE_INSTANCE
+    if _PADDLE_INSTANCE is not None:
+        return _PADDLE_INSTANCE
+    if PaddleOCR is None:
         return None
-
-    weight = find_metric("weight")
-    pbf = find_metric("pbf")
-    smm = find_metric("smm")
-
-    # fallback: иногда InBody пишет значения без рядом стоящих слов,
-    # поэтому пытаемся по наиболее вероятным диапазонам.
-    all_nums = [_to_float(x) for x in re.findall(FLOAT_RE, t)]
-    all_nums = [x for x in all_nums if x is not None]
-
-    if weight is None:
-        # типичный вес 35..200
-        candidates = [x for x in all_nums if 35 <= x <= 200]
-        if candidates:
-            weight = max(candidates)  # часто вес — самое большое число
-
-    if pbf is None:
-        # жир 3..60
-        candidates = [x for x in all_nums if 3 <= x <= 60]
-        if candidates:
-            pbf = min(candidates) if len(candidates) > 1 else candidates[0]
-
-    if smm is None:
-        # мышцы 15..80
-        candidates = [x for x in all_nums if 15 <= x <= 80]
-        # исключим вес
-        if weight is not None:
-            candidates = [x for x in candidates if abs(x - weight) > 3]
-        if candidates:
-            smm = max(candidates)
-
-    if weight is not None:
-        found["weight_kg"] = round(float(weight), 1)
-    if pbf is not None:
-        found["pbf_percent"] = round(float(pbf), 1)
-    if smm is not None:
-        found["smm_kg"] = round(float(smm), 1)
-
-    score = 0
-    if "weight_kg" in found:
-        score += 1
-    if "pbf_percent" in found:
-        score += 1
-    if "smm_kg" in found:
-        score += 1
-
-    return found, score
+    try:
+        _PADDLE_INSTANCE = PaddleOCR(
+            use_angle_cls=True,
+            lang="ru",       # ← было "en", теперь читает кириллицу
+            use_gpu=use_gpu,
+            show_log=False,
+        )
+    except Exception:
+        _PADDLE_INSTANCE = None
+    return _PADDLE_INSTANCE
 
 
-def run_inbody_ocr(image_path: str, use_gpu: bool = False):
-    """
-    Основная функция:
-    - загружает фото
-    - делает preprocessing + несколько OCR попыток
-    - выбирает лучший результат по числу найденных метрик
-    """
+def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
     if not os.path.exists(image_path):
         return {"ok": False, "error": "Файл не найден"}
-
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         return {"ok": False, "error": "Не удалось прочитать изображение"}
 
-    # init Paddle once
-    paddle = None
-    if PaddleOCR is not None:
-        try:
-            paddle = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=use_gpu)
-        except Exception:
-            paddle = None
-
-    variants = _preprocess_variants(img_bgr)
+    ocr = _get_paddle(use_gpu)
+    if ocr is None:
+        return {"ok": False, "error": "OCR-движок недоступен"}
 
     best = {
-        "score": -1,
         "metrics": {},
-        "text": "",
+        "items": [],
         "variant": "",
-        "engine": "",
+        "score": -1.0,
+        "debug": {},
     }
 
-    for name, imgv in variants:
-        # PaddleOCR
-        if paddle is not None:
-            text = _paddle_ocr_text(paddle, imgv)
-            metrics, score = parse_inbody_metrics(text)
-            if score > best["score"]:
-                best.update({
-                    "score": score,
-                    "metrics": metrics,
-                    "text": text,
-                    "variant": name,
-                    "engine": "paddle",
-                })
-
-        # Tesseract fallback
-        text2 = _tesseract_text(imgv)
-        metrics2, score2 = parse_inbody_metrics(text2)
-        if score2 > best["score"]:
-            best.update({
-                "score": score2,
-                "metrics": metrics2,
-                "text": text2,
+    for name, imgv in _preprocess_variants(img_bgr):
+        items = _run_paddle(ocr, imgv)
+        if not items:
+            continue
+        metrics, dbg = parse_inbody_items(items)
+        # score: 1 за метрику + 0.5 за anchor-источник
+        score = float(sum(1 for k in ("weight_kg", "pbf_percent", "smm_kg") if k in metrics))
+        score += sum(0.5 for v in dbg.values() if v.get("source") == "anchor")
+        if score > best["score"]:
+            best = {
+                "metrics": metrics,
+                "items": items,
                 "variant": name,
-                "engine": "tesseract",
-            })
+                "score": score,
+                "debug": dbg,
+            }
 
-    confidence = min(1.0, best["score"] / 3.0)
+    metrics = best["metrics"]
+    # confidence: 33% за каждую найденную метрику + 4% бонус если она через anchor
+    conf = 0.0
+    for k in ("weight_kg", "pbf_percent", "smm_kg"):
+        if k in metrics:
+            conf += 0.33
+            if best["debug"].get(k, {}).get("source") == "anchor":
+                conf += 0.04
+    conf = round(min(1.0, conf), 2)
 
+    raw_text = "\n".join(it.text for it in best["items"])[:4000]
     return {
         "ok": True,
-        "metrics": best["metrics"],
-        "confidence": confidence,
-        "raw_text": best["text"][:4000],
-        "debug": {"variant": best["variant"], "engine": best["engine"], "score": best["score"]},
+        "metrics": metrics,
+        "confidence": conf,
+        "raw_text": raw_text,
+        "debug": {
+            "variant": best["variant"],
+            "score": best["score"],
+            "engine": "paddle-ru",
+            "matches": best["debug"],
+        },
     }
