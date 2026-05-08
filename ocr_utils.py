@@ -1,20 +1,26 @@
 """OCR для InBody-распечаток.
 
-После тестов на реальных фото InBody570:
-- PaddleOCR русский/мультиязычный — выдаёт мусор на печатных мелких отчётах ("сэдржнэ" вместо "содержание").
-- Tesseract с пакетом `tesseract-ocr-rus` справляется НАМНОГО лучше — печатный текст это его конёк.
+Подход после практических замеров:
+- PaddleOCR (ru/multi) на печатных мелких отчётах InBody570 даёт мусор.
+- Tesseract `image_to_data` тоже плохо: резко режет уверенность и фрагментирует.
+- Tesseract `image_to_string` с `lang="rus+eng"` и `--psm 6/4` — единственный, что даёт
+  читаемый текст с числами 79.3, 41.7, 7.4 на той же строке, что и подписи.
 
-Поэтому стратегия:
-- Основной движок — **Tesseract** (`image_to_data`, чтобы получить bbox для каждого слова).
-- Несколько preprocessing-вариантов; для каждого собираем `OcrItem`-ы (text + bbox).
-- Парсинг через якоря (Идеальный Вес, Процентное содержание жира, Масса скелетной мускулатуры,
-  плюс типичные "(kg)"/"(%)" подписи рядом со значениями).
-- В качестве fallback можно гонять PaddleOCR, но в большинстве случаев он только мешает.
+Стратегия:
+1) 2 preprocessing-варианта (orig RGB + upscale×2 + denoise + CLAHE + sharpen).
+2) Для каждого варианта берём 1-2 PSM-режима, прогоняем `image_to_string`.
+3) Парсим **построчно**: ищем строки со знакомыми подписями («Идеальный Вес», «Процентное …
+   жира», «Масса скелетной …», плюс короткие "Вес (kg)" в History) — на той же строке
+   достаём число.
+4) Защиты:
+   • очень нестрогая нормализация подписи (Tesseract путает кириллицу/латиницу: «Bec»/«Вес»);
+   • число «79. 3» с пробелом нормализуется в 79.3;
+   • валидные диапазоны (вес 30..250, SMM 10..80, PBF 3..60) — отсеиваем шум;
+   • уверенность считается от количества якорно-найденных метрик, а не «100% если хоть что-то нашли».
 """
 
 import os
 import re
-from dataclasses import dataclass
 from typing import Optional
 
 import cv2
@@ -32,26 +38,10 @@ except Exception:
 
 
 # ----------------------------------------------------------------------------
-# OCR item
+# Numbers
 # ----------------------------------------------------------------------------
-@dataclass
-class OcrItem:
-    text: str
-    cx: float
-    cy: float
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    conf: float
-
-    @property
-    def h(self) -> float:
-        return max(1.0, self.y2 - self.y1)
-
-
-# Допускаем пробел между разрядами и точкой/запятой («79. 3», «79 ,3»).
-_NUM_RE = re.compile(r"[-+]?\d{1,4}(?:\s*[.,]\s*\d{1,3})?")
+# Допускаем «79. 3», «79 ,3», «79.3», «79,3».
+_NUM_RE = re.compile(r"\d{1,4}(?:\s*[.,]\s*\d{1,3})?")
 
 
 def _to_float(s: str) -> Optional[float]:
@@ -62,13 +52,8 @@ def _to_float(s: str) -> Optional[float]:
         return None
 
 
-def _extract_numbers(text: str):
-    out = []
-    for m in _NUM_RE.finditer(text):
-        v = _to_float(m.group(0))
-        if v is not None:
-            out.append(v)
-    return out
+def _numbers_in(s: str):
+    return [v for v in (_to_float(m.group(0)) for m in _NUM_RE.finditer(s)) if v is not None]
 
 
 # ----------------------------------------------------------------------------
@@ -96,166 +81,75 @@ def _deskew(img_bgr: np.ndarray) -> np.ndarray:
 
 
 def _preprocess_variants(img_bgr: np.ndarray):
-    """Готовим 2 варианта: (a) оригинал в RGB и (b) upscale×2 + denoise + CLAHE."""
+    """Готовим 2 варианта изображения для Tesseract."""
     base = _deskew(img_bgr)
 
-    # 1) original RGB (PIL ждёт RGB)
+    # 1) оригинал в RGB (PIL ждёт RGB-каналы)
     yield "orig", cv2.cvtColor(base, cv2.COLOR_BGR2RGB)
 
-    # 2) upscaled + denoised + CLAHE
+    # 2) upscale ×2 + denoise + CLAHE + sharpen
     h, w = base.shape[:2]
     up = cv2.resize(base, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC) if max(h, w) < 1800 else base.copy()
     g = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
     g = cv2.fastNlMeansDenoising(g, None, 10, 7, 21)
     g = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(g)
-    yield "upscaled", g  # одноканальный grayscale, PIL это переварит
+    sharpen_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    g = cv2.filter2D(g, -1, sharpen_k)
+    yield "upscaled", g  # одноканальный grayscale, PIL переварит
 
 
 # ----------------------------------------------------------------------------
-# Tesseract → OcrItem[]
+# OCR text via Tesseract
 # ----------------------------------------------------------------------------
-def _tesseract_items(img_for_pil) -> list:
-    """Возвращает список OcrItem на основе `pytesseract.image_to_data`."""
+def _tesseract_text(img_for_pil, psm: int = 6) -> str:
     if pytesseract is None or Image is None:
-        return []
+        return ""
     pil = Image.fromarray(img_for_pil)
-    config = "--oem 3 --psm 6"
-    try:
-        data = pytesseract.image_to_data(
-            pil,
-            lang="rus+eng",
-            config=config,
-            output_type=pytesseract.Output.DICT,
-        )
-    except Exception:
+    cfg = f"--oem 3 --psm {psm}"
+    for lang in ("rus+eng", "eng"):
         try:
-            data = pytesseract.image_to_data(
-                pil, lang="eng", config=config, output_type=pytesseract.Output.DICT
-            )
-        except Exception:
-            return []
-
-    items: list = []
-    n = len(data.get("text", []))
-    for i in range(n):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
-            continue
-        try:
-            x = float(data["left"][i])
-            y = float(data["top"][i])
-            w = float(data["width"][i])
-            h = float(data["height"][i])
-            conf = float(data["conf"][i]) / 100.0
+            return pytesseract.image_to_string(pil, lang=lang, config=cfg)
         except Exception:
             continue
-        items.append(OcrItem(
-            text=txt,
-            cx=x + w / 2,
-            cy=y + h / 2,
-            x1=x,
-            y1=y,
-            x2=x + w,
-            y2=y + h,
-            conf=max(0.0, conf),
-        ))
-
-    # Tesseract бьёт текст по словам — склеим соседей, чтобы '(kg)' или '79.3' не разваливались.
-    # Соседями считаем те, что в одной строке и расстояние < ширина одного символа.
-    return _merge_neighbors(items)
-
-
-def _merge_neighbors(items: list) -> list:
-    if not items:
-        return []
-    items_sorted = sorted(items, key=lambda it: (it.cy, it.cx))
-    merged: list = []
-    for it in items_sorted:
-        if merged:
-            prev = merged[-1]
-            same_row = (
-                min(prev.y2, it.y2) - max(prev.y1, it.y1)
-            ) > 0.5 * min(prev.h, it.h)
-            close = (it.x1 - prev.x2) < 0.6 * max(prev.h, it.h)
-            if same_row and close:
-                # склеиваем
-                prev.text = (prev.text + " " + it.text).strip()
-                prev.x2 = max(prev.x2, it.x2)
-                prev.y1 = min(prev.y1, it.y1)
-                prev.y2 = max(prev.y2, it.y2)
-                prev.cx = (prev.x1 + prev.x2) / 2
-                prev.cy = (prev.y1 + prev.y2) / 2
-                prev.conf = min(prev.conf, it.conf)
-                continue
-        # новая «фраза»
-        merged.append(OcrItem(
-            text=it.text, cx=it.cx, cy=it.cy,
-            x1=it.x1, y1=it.y1, x2=it.x2, y2=it.y2, conf=it.conf,
-        ))
-    return merged
+    return ""
 
 
 # ----------------------------------------------------------------------------
-# Spatial helpers
+# Label patterns (нестрогие, учитываем мусор Tesseract)
 # ----------------------------------------------------------------------------
-def _same_row(a: OcrItem, b: OcrItem, tol_ratio: float = 0.5) -> bool:
-    overlap = min(a.y2, b.y2) - max(a.y1, b.y1)
-    return overlap > 0 and overlap / min(a.h, b.h) >= tol_ratio
+# Разные варианты «Вес», т.к. Tesseract часто путает В/B, ес/ec/яс/еe.
+_W_VAR = r"(?:вес|bес|bec|вeс|вес|wec|wес|bеc|ьес|нес)"
+_VES_VAR = r"(?:[вbBв][ея][ес][ея]?|[bB][ea][cз])"
 
-
-def _first_num_in(item: OcrItem) -> Optional[float]:
-    nums = _extract_numbers(item.text)
-    return nums[0] if nums else None
-
-
-def _value_for_label(label: OcrItem, items, max_dx_chars: float = 25) -> Optional[float]:
-    n = _first_num_in(label)
-    if n is not None:
-        return n
-
-    # на той же строке справа — берём первый item с цифрой
-    same_row = sorted(
-        (it for it in items if it is not label and _same_row(label, it) and it.cx > label.cx),
-        key=lambda it: it.cx,
-    )
-    for it in same_row:
-        n = _first_num_in(it)
-        if n is not None:
-            return n
-
-    # ниже под подписью (для двухстрочных карточек) — но не очень далеко
-    label_w = max(1.0, label.x2 - label.x1)
-    below = sorted(
-        (
-            it for it in items
-            if it is not label
-            and it.cy > label.y2
-            and abs(it.cx - label.cx) < label_w
-            and (it.cy - label.y2) < 4 * label.h
-        ),
-        key=lambda it: it.cy,
-    )
-    for it in below:
-        n = _first_num_in(it)
-        if n is not None:
-            return n
-
-    return None
-
-
-# ----------------------------------------------------------------------------
-# Parser
-# ----------------------------------------------------------------------------
-# фази-паттерны: Tesseract иногда даёт мусор в одной-двух буквах,
-# поэтому проверяем по подстрокам/корням.
 _LABEL_PATTERNS = {
-    # явные InBody-якоря (надёжнее всего)
-    "ideal_weight":   re.compile(r"идеальн\w*\s*[вbBв]ес", re.IGNORECASE),
-    "pbf_full":       re.compile(r"процент\w*\s*содерж\w*\s*жир", re.IGNORECASE),
-    "smm_full":       re.compile(r"(масса|массы)\s+скелетн", re.IGNORECASE),
-    "weight_control": re.compile(r"контрол\w*\s*вес", re.IGNORECASE),
-    # generic
-    "weight_short":   re.compile(r"^\s*(вес|bес)\s*\(?\s*kg\s*\)?\s*$", re.IGNORECASE),
+    # «Идеальный Вес» (правый верхний блок), допускаем мусор в окончании и в "Вес"
+    "ideal_weight": re.compile(
+        r"идеальн\w*\s*[вbB][ея][ес][ея]?",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # Иногда Tesseract схлопывает в одно слово: «Ипеальыйвее»
+    "ideal_weight_glued": re.compile(
+        r"и[пнт]еа[лр]ь?ны\w*\s*[вbB]\w{0,3}",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    "pbf_full": re.compile(
+        r"процент\w*\s+содерж\w*\s+жир",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # компактная «Содержание жира» (тоже встречается)
+    "pbf_short": re.compile(
+        r"содерж\w*\s+жир",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    "smm_full": re.compile(
+        r"(масс|месс|нес)\w*\s*скел[еe]тн",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Вес (kg)» в истории — короткая подпись
+    "weight_short": re.compile(
+        r"^\s*\W*(вес|bес|bec)\W*(kg|кг)\W*$",
+        re.IGNORECASE | re.UNICODE,
+    ),
 }
 
 _RANGE = {
@@ -270,7 +164,14 @@ def _in_range(metric: str, value: float) -> bool:
     return lo <= value <= hi
 
 
-def parse_inbody_items(items):
+# ----------------------------------------------------------------------------
+# Парсер
+# ----------------------------------------------------------------------------
+def parse_inbody_text(text: str):
+    """Прогоняем построчно. Для каждой строки — match на подписи, потом числа.
+
+    Возвращает (metrics, debug).
+    """
     metrics: dict = {}
     debug: dict = {}
 
@@ -283,37 +184,64 @@ def parse_inbody_items(items):
             metrics[metric] = round(float(value), 1)
             debug[metric] = {"source": source, "label": label_text}
 
-    # 1) Самый чёткий якорь — "Идеальный Вес 79.3 kg" (правый верхний блок отчёта)
-    for it in items:
-        if "weight_kg" not in metrics and _LABEL_PATTERNS["ideal_weight"].search(it.text):
-            try_set("weight_kg", _value_for_label(it, items), "anchor:ideal", it.text)
-        if "pbf_percent" not in metrics and _LABEL_PATTERNS["pbf_full"].search(it.text):
-            try_set("pbf_percent", _value_for_label(it, items), "anchor:pbf_full", it.text)
-        if "smm_kg" not in metrics and _LABEL_PATTERNS["smm_full"].search(it.text):
-            try_set("smm_kg", _value_for_label(it, items), "anchor:smm_full", it.text)
+    lines = [ln for ln in text.splitlines() if ln.strip()]
 
-    # 2) Запасной — "Контроль Веса" (но это часто 0.0; отбрасываем малые числа)
+    # Проход 1 — приоритетные якоря
+    for ln in lines:
+        # weight: «Идеальный Вес 79.3 kg»
+        if "weight_kg" not in metrics:
+            m = _LABEL_PATTERNS["ideal_weight"].search(ln) or _LABEL_PATTERNS["ideal_weight_glued"].search(ln)
+            if m:
+                # берём первое число с разделителем (.,) — приоритет «реальное значение»
+                nums = _numbers_in(ln[m.end():])
+                # фильтруем малозначащие: control_weight 0.0 идёт ниже,
+                # но «Идеальный Вес» — заведомо большое число.
+                cand = [n for n in nums if n >= 30.0]
+                if cand:
+                    try_set("weight_kg", cand[0], "anchor:ideal", ln.strip())
+
+        if "pbf_percent" not in metrics:
+            m = _LABEL_PATTERNS["pbf_full"].search(ln)
+            if m:
+                nums = _numbers_in(ln[m.end():])
+                if nums:
+                    try_set("pbf_percent", nums[0], "anchor:pbf_full", ln.strip())
+
+        if "smm_kg" not in metrics:
+            m = _LABEL_PATTERNS["smm_full"].search(ln)
+            if m:
+                nums = _numbers_in(ln[m.end():])
+                if nums:
+                    try_set("smm_kg", nums[0], "anchor:smm_full", ln.strip())
+
+    # Проход 2 — генерики по таблице «История состава тела»:
+    # короткие строки «(kg) 79.3» / «(kg) 41.7» рядом с подписью.
+    # InBody печатает их вертикально, поэтому ищем сочетания подписи на одной
+    # строке с числом, либо подпись на следующей строке после "(kg)".
     if "weight_kg" not in metrics:
-        for it in items:
-            if _LABEL_PATTERNS["weight_control"].search(it.text):
-                v = _value_for_label(it, items)
-                if v is not None and v >= 30.0:
-                    try_set("weight_kg", v, "anchor:control", it.text)
+        for ln in lines:
+            if _LABEL_PATTERNS["weight_short"].search(ln):
+                nums = _numbers_in(ln)
+                cand = [n for n in nums if n >= 30.0]
+                if cand:
+                    try_set("weight_kg", cand[0], "generic:weight_short", ln.strip())
                     break
 
-    # 3) Generic «Вес (kg)» — берём правое значение
-    if "weight_kg" not in metrics:
-        for it in items:
-            if _LABEL_PATTERNS["weight_short"].search(it.text):
-                try_set("weight_kg", _value_for_label(it, items), "generic:weight_short", it.text)
-                if "weight_kg" in metrics:
-                    break
+    if "pbf_percent" not in metrics:
+        for ln in lines:
+            m = _LABEL_PATTERNS["pbf_short"].search(ln)
+            if m:
+                nums = _numbers_in(ln[m.end():])
+                if nums:
+                    try_set("pbf_percent", nums[0], "generic:pbf_short", ln.strip())
+                    if "pbf_percent" in metrics:
+                        break
 
     return metrics, debug
 
 
 # ----------------------------------------------------------------------------
-# Main entry
+# Main
 # ----------------------------------------------------------------------------
 def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
     if not os.path.exists(image_path):
@@ -326,31 +254,28 @@ def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
 
     best = {
         "metrics": {},
-        "items": [],
+        "raw": "",
         "variant": "",
+        "psm": 6,
         "score": -1.0,
         "debug": {},
     }
 
-    for name, imgv in _preprocess_variants(img_bgr):
-        items = _tesseract_items(imgv)
-        if not items:
-            continue
-        metrics, dbg = parse_inbody_items(items)
-        # 1 за каждую метрику, +0.5 за anchor-источник
-        score = float(sum(1 for k in ("weight_kg", "pbf_percent", "smm_kg") if k in metrics))
-        score += sum(
-            0.5 for v in dbg.values()
-            if isinstance(v, dict) and str(v.get("source", "")).startswith("anchor")
-        )
-        if score > best["score"]:
-            best = {
-                "metrics": metrics,
-                "items": items,
-                "variant": name,
-                "score": score,
-                "debug": dbg,
-            }
+    # Сливаем всё, что нашли разные варианты OCR — берём лучший по числу метрик.
+    for vname, imgv in _preprocess_variants(img_bgr):
+        for psm in (6, 4):
+            txt = _tesseract_text(imgv, psm=psm)
+            if not txt.strip():
+                continue
+            m, d = parse_inbody_text(txt)
+            score = float(sum(1 for k in ("weight_kg", "pbf_percent", "smm_kg") if k in m))
+            score += sum(
+                0.5 for v in d.values()
+                if isinstance(v, dict) and str(v.get("source", "")).startswith("anchor")
+            )
+            if score > best["score"]:
+                best = {"metrics": m, "raw": txt, "variant": vname, "psm": psm,
+                        "score": score, "debug": d}
 
     metrics = best["metrics"]
     conf = 0.0
@@ -362,14 +287,14 @@ def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
                 conf += 0.04
     conf = round(min(1.0, conf), 2)
 
-    raw_text = "\n".join(it.text for it in best["items"])[:4000]
     return {
         "ok": True,
         "metrics": metrics,
         "confidence": conf,
-        "raw_text": raw_text,
+        "raw_text": (best["raw"] or "")[:4000],
         "debug": {
             "variant": best["variant"],
+            "psm": best["psm"],
             "score": best["score"],
             "engine": "tesseract-rus+eng",
             "matches": best["debug"],
