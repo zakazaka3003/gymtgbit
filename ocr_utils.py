@@ -1,339 +1,437 @@
+"""OCR для InBody-распечаток.
+
+Подход после практических замеров:
+- PaddleOCR (ru/multi) на печатных мелких отчётах InBody570 даёт мусор.
+- Tesseract `image_to_data` тоже плохо: резко режет уверенность и фрагментирует.
+- Tesseract `image_to_string` с `lang="rus+eng"` и `--psm 6/4` — единственный, что даёт
+  читаемый текст с числами 79.3, 41.7, 7.4 на той же строке, что и подписи.
+
+Стратегия:
+1) 2 preprocessing-варианта (orig RGB + upscale×2 + denoise + CLAHE + sharpen).
+2) Для каждого варианта берём 1-2 PSM-режима, прогоняем `image_to_string`.
+3) Парсим **построчно**: ищем строки со знакомыми подписями («Идеальный Вес», «Процентное …
+   жира», «Масса скелетной …», плюс короткие "Вес (kg)" в History) — на той же строке
+   достаём число.
+4) Защиты:
+   • очень нестрогая нормализация подписи (Tesseract путает кириллицу/латиницу: «Bec»/«Вес»);
+   • число «79. 3» с пробелом нормализуется в 79.3;
+   • валидные диапазоны (вес 30..250, SMM 10..80, PBF 3..60) — отсеиваем шум;
+   • уверенность считается от количества якорно-найденных метрик, а не «100% если хоть что-то нашли».
+"""
+
 import os
 import re
-import math
+from typing import Optional
+
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
-
-try:
-    from paddleocr import PaddleOCR
-except Exception:
-    PaddleOCR = None
 
 try:
     import pytesseract
 except Exception:
     pytesseract = None
 
-
-_METRIC_SYNONYMS = {
-    "weight": [
-        r"\bweight\b", r"\bвес\b",
-    ],
-    "pbf": [
-        r"\bpbf\b", r"\bbody\s*fat\b", r"\bfat\b",
-        r"\bжир\b", r"\bжировая\s*масса\b", r"\bжировая\b",
-    ],
-    "smm": [
-        r"\bsmm\b", r"\bskeletal\s*muscle\b", r"\bmuscle\b",
-        r"\bмышц", r"\bмышечная\s*масса\b",
-    ],
-}
-
-FLOAT_RE = r"(\d{1,3}(?:[.,]\d{1,2})?)"
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
 
-def _to_float(x: str):
-    x = x.strip().replace(" ", "").replace(",", ".")
+# ----------------------------------------------------------------------------
+# Numbers
+# ----------------------------------------------------------------------------
+# Допускаем «79. 3», «79 ,3», «79.3», «79,3».
+_NUM_RE = re.compile(r"\d{1,4}(?:\s*[.,]\s*\d{1,3})?")
+# Только дробные числа — игнорируем целые tick-метки на bar-chart.
+_DEC_NUM_RE = re.compile(r"\d{1,3}\s*[.,]\s*\d{1,2}")
+
+
+def _to_float(s: str) -> Optional[float]:
+    s = s.strip().replace(" ", "").replace(",", ".")
     try:
-        return float(x)
+        return float(s)
     except Exception:
         return None
 
 
-def _safe_crop_document(img_bgr: np.ndarray):
-    """Попытка вырезать лист/рамку по контурам."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
-    )
-    thr_inv = 255 - thr
-
-    contours, _ = cv2.findContours(thr_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return img_bgr
-
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    h, w = gray.shape[:2]
-
-    for c in contours[:5]:
-        area = cv2.contourArea(c)
-        if area < 0.25 * (w * h):
-            continue
-        rect = cv2.minAreaRect(c)
-        box = cv2.boxPoints(rect)
-        box = np.int0(box)
-
-        x, y, bw, bh = cv2.boundingRect(box)
-        pad = int(0.02 * max(w, h))
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(w, x + bw + pad)
-        y1 = min(h, y + bh + pad)
-        crop = img_bgr[y0:y1, x0:x1]
-        if crop.size > 0:
-            return crop
-    return img_bgr
+def _numbers_in(s: str):
+    return [v for v in (_to_float(m.group(0)) for m in _NUM_RE.finditer(s)) if v is not None]
 
 
-def _deskew(img_bgr: np.ndarray):
-    """Deskew: оцениваем угол наклона по минимальному прямоугольнику текста."""
+def _decimals_in(s: str):
+    return [v for v in (_to_float(m.group(0)) for m in _DEC_NUM_RE.finditer(s)) if v is not None]
+
+
+# ----------------------------------------------------------------------------
+# Date detection
+# ----------------------------------------------------------------------------
+# InBody печатает «2026.03.15. 11:17». Также встречаются варианты:
+#   2026-03-15, 2026/03/15, 15.03.2026, 15-03-2026, 15/03/2026, 03/15/2026.
+_DATE_PATTERNS = [
+    # YYYY?.?MM?.?DD (InBody — основной). Альтернативы дня — сначала длинные!
+    (re.compile(r"(20\d{2})[.\-/](1[0-2]|0?[1-9])[.\-/](3[01]|[12]\d|0?[1-9])"), "ymd"),
+    # DD.MM.YYYY (русский формат)
+    (re.compile(r"(3[01]|[12]\d|0?[1-9])[.\-/](1[0-2]|0?[1-9])[.\-/](20\d{2})"), "dmy"),
+]
+
+
+def _try_extract_date(text: str) -> Optional[str]:
+    """Возвращает дату в формате YYYY-MM-DD или None.
+
+    Стратегия: сканируем построчно, отдаём первое совпадение, отдавая приоритет
+    строкам, содержащим слова «дата» / «проверк» / «test» — чтобы не схватить
+    случайные числа из таблицы.
+    """
+    import datetime as _dt
+
+    def _validate(y: int, m: int, d: int) -> Optional[str]:
+        try:
+            iso = _dt.date(y, m, d).isoformat()
+        except Exception:
+            return None
+        # отбрасываем невменяемые годы
+        if y < 2010 or y > 2100:
+            return None
+        return iso
+
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    candidates = []  # (priority_score, iso_date)
+
+    for ln in raw_lines:
+        norm = _normalize_cyr(ln).lower()
+        # Мини-эвристика: рядом с подписью «Дата проверки» или «Test Date» —
+        # очень вероятно искомая дата.
+        priority = 0
+        if "дата" in norm or "провер" in norm or "test" in norm or "date" in norm:
+            priority = 10
+
+        for pat, kind in _DATE_PATTERNS:
+            for mt in pat.finditer(ln):
+                a, b, c = mt.group(1), mt.group(2), mt.group(3)
+                if kind == "ymd":
+                    iso = _validate(int(a), int(b), int(c))
+                else:  # dmy
+                    iso = _validate(int(c), int(b), int(a))
+                if iso:
+                    candidates.append((priority, iso, ln.strip()))
+
+    if not candidates:
+        return None
+
+    # сортируем: сначала строки с подсказками («Дата»…), потом по порядку появления
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0][1]
+
+
+# Tesseract на печатной кириллице регулярно подсовывает латиницу-двойник
+# (M, a, c, e, o, p, x, y, B, H, K, T, ...). Делаем безопасный мапинг
+# для матчинга подписей: исходный текст в логи мы храним, для regex —
+# нормализованный.
+_LAT2CYR = str.maketrans({
+    "M": "М", "a": "а", "c": "с", "e": "е", "o": "о", "p": "р",
+    "x": "х", "y": "у", "B": "В", "H": "Н", "K": "К", "T": "Т",
+    "P": "Р", "C": "С", "A": "А", "E": "Е", "O": "О", "X": "Х", "Y": "У",
+})
+
+
+def _normalize_cyr(s: str) -> str:
+    return s.translate(_LAT2CYR)
+
+
+# ----------------------------------------------------------------------------
+# Preprocessing
+# ----------------------------------------------------------------------------
+def _deskew(img_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     thr = 255 - thr
-
     coords = np.column_stack(np.where(thr > 0))
     if coords.shape[0] < 300:
         return img_bgr
-
     rect = cv2.minAreaRect(coords)
     angle = rect[-1]
     if angle < -45:
         angle = -(90 + angle)
     else:
         angle = -angle
-
     if abs(angle) < 0.3:
         return img_bgr
-
-    (h, w) = img_bgr.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(
-        img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-    )
-    return rotated
-
-
-def _clahe(gray: np.ndarray):
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    return clahe.apply(gray)
-
-
-def _sharpen(img: np.ndarray):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]])
-    return cv2.filter2D(img, -1, kernel)
+    h, w = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 
 def _preprocess_variants(img_bgr: np.ndarray):
-    """Готовим несколько вариантов изображения (pipeline)."""
-    variants = []
+    """Готовим 2 варианта изображения для Tesseract.
 
-    # base: auto-rotate + crop
-    img = _deskew(img_bgr)
-    img = _safe_crop_document(img)
+    ВАЖНО: НЕ ДЕЛАЕМ deskew. На реальных InBody-фото он чаще всего ломает OCR
+    (после нашего теста — превращает чистый текст в мусор), потому что ищет
+    угол по плотным колонкам/строкам таблицы и крутит на ~ доли градуса.
+    Печатные отчёты приходят выровненными, и Tesseract сам толерантен к небольшим
+    отклонениям.
+    """
+    # 1) raw RGB (PIL ждёт RGB-каналы)
+    yield "orig", cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    variants.append(("orig", img))
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # attempt 2: CLAHE + adaptive threshold + morphology
-    g2 = _clahe(gray)
-    thr = cv2.adaptiveThreshold(
-        g2, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
-    )
-    thr = cv2.medianBlur(thr, 3)
-    kernel = np.ones((2, 2), np.uint8)
-    thr = cv2.dilate(thr, kernel, iterations=1)
-    thr = cv2.erode(thr, kernel, iterations=1)
-    variants.append(("thr", cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR)))
-
-    # attempt 3: upscale + sharpen + denoise
-    scale = 2
-    up = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    up_gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    up_gray = cv2.fastNlMeansDenoising(up_gray, None, 15, 7, 21)
-    up_gray = _clahe(up_gray)
-    up_gray = _sharpen(up_gray)
-    thr2 = cv2.threshold(up_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    variants.append(("up_sharp", cv2.cvtColor(thr2, cv2.COLOR_GRAY2BGR)))
-
-    # attempt 4: more aggressive upscale x3
-    scale = 3
-    up3 = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    up3 = cv2.fastNlMeansDenoisingColored(up3, None, 10, 10, 7, 21)
-    up3g = cv2.cvtColor(up3, cv2.COLOR_BGR2GRAY)
-    up3g = _clahe(up3g)
-    thr3 = cv2.adaptiveThreshold(
-        up3g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 41, 9
-    )
-    thr3 = _sharpen(thr3)
-    variants.append(("up3_aggr", cv2.cvtColor(thr3, cv2.COLOR_GRAY2BGR)))
-
-    return variants
+    # 2) upscale ×2 без агрессивных фильтров — иногда помогает на низком DPI.
+    h, w = img_bgr.shape[:2]
+    if max(h, w) < 1800:
+        up = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        yield "upscaled", cv2.cvtColor(up, cv2.COLOR_BGR2RGB)
 
 
-def _paddle_ocr_text(ocr, img_bgr: np.ndarray):
-    """Вернуть text из PaddleOCR."""
-    try:
-        res = ocr.ocr(img_bgr, cls=True)
-        lines = []
-        for block in res:
-            for item in block:
-                txt = item[1][0]
-                if txt:
-                    lines.append(txt)
-        return "\n".join(lines)
-    except Exception:
+# ----------------------------------------------------------------------------
+# OCR text via Tesseract
+# ----------------------------------------------------------------------------
+def _tesseract_text(img_for_pil, psm: int = 6) -> str:
+    if pytesseract is None or Image is None:
         return ""
-
-
-def _tesseract_text(img_bgr: np.ndarray):
-    if pytesseract is None:
-        return ""
-    # tesseract любит RGB/PIL
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
-    try:
-        config = r"--oem 3 --psm 6"
-        return pytesseract.image_to_string(pil, lang="eng+rus", config=config)
-    except Exception:
+    pil = Image.fromarray(img_for_pil)
+    cfg = f"--oem 3 --psm {psm}"
+    for lang in ("rus+eng", "eng"):
         try:
-            # fallback eng only
-            return pytesseract.image_to_string(pil, lang="eng", config=r"--oem 3 --psm 6")
+            return pytesseract.image_to_string(pil, lang=lang, config=cfg)
         except Exception:
-            return ""
+            continue
+    return ""
 
 
-def parse_inbody_metrics(text: str):
+# ----------------------------------------------------------------------------
+# Label patterns (нестрогие, учитываем мусор Tesseract)
+# ----------------------------------------------------------------------------
+# Разные варианты «Вес», т.к. Tesseract часто путает В/B, ес/ec/яс/еe.
+_W_VAR = r"(?:вес|bес|bec|вeс|вес|wec|wес|bеc|ьес|нес)"
+_VES_VAR = r"(?:[вbBв][ея][ес][ея]?|[bB][ea][cз])"
+
+_LABEL_PATTERNS = {
+    # «Идеальный Вес» (правый верхний блок).
+    "ideal_weight": re.compile(
+        r"идеальн\w*\s*в\w{1,3}",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # Иногда Tesseract схлопывает в одно слово: «Ипеальыйвее»
+    "ideal_weight_glued": re.compile(
+        r"и[пнт]еа[лр]ь?ны\w*\s*в\w{0,3}",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Процентное содержание жира»
+    "pbf_full": re.compile(
+        r"процент\w*\s+содерж\w*\s+жир",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # компактная «Содержание жира» (тоже встречается)
+    "pbf_short": re.compile(
+        r"содерж\w*\s+жир",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Масса/Массы скелетной мускулатуры» — после нормализации латиницы
+    # «Maces» превращается в «Мaceс/Масеs»; ловим по «мас… скел…».
+    "smm_full": re.compile(
+        r"мас\w*\s*скел[еeё]тн",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Мускулатуры» отдельно — иногда подпись разорвана, и значение лежит
+    # на строке с «мускулатуры …».
+    "smm_continuation": re.compile(
+        r"мускулатур",
+        re.IGNORECASE | re.UNICODE,
+    ),
+    # «Вес (kg)» в истории — короткая подпись
+    "weight_short": re.compile(
+        r"^\s*\W*(вес)\W*(kg|кг)\W*",
+        re.IGNORECASE | re.UNICODE,
+    ),
+}
+
+_RANGE = {
+    "weight_kg":   (30.0, 250.0),
+    "smm_kg":      (10.0, 80.0),
+    "pbf_percent": (3.0, 60.0),
+}
+
+
+def _in_range(metric: str, value: float) -> bool:
+    lo, hi = _RANGE[metric]
+    return lo <= value <= hi
+
+
+# ----------------------------------------------------------------------------
+# Парсер
+# ----------------------------------------------------------------------------
+def parse_inbody_text(text: str):
+    """Прогоняем построчно. Для каждой строки — match на подписи, потом числа.
+
+    Возвращает (metrics, debug).
     """
-    Парсер устойчивый к шуму.
-    Возвращает dict: weight_kg, pbf_percent, smm_kg + score.
-    """
-    raw = text or ""
-    t = raw.lower()
-    t = t.replace("—", "-")
+    metrics: dict = {}
+    debug: dict = {}
 
-    found = {}
+    def try_set(metric: str, value, source: str, label_text: str):
+        if value is None:
+            return
+        if not _in_range(metric, float(value)):
+            return
+        if metric not in metrics:
+            metrics[metric] = round(float(value), 1)
+            debug[metric] = {"source": source, "label": label_text}
 
-    def find_metric(metric_key):
-        patterns = _METRIC_SYNONYMS[metric_key]
-        for p in patterns:
-            # допускаем мусор между словом и числом
-            rx = re.compile(p + r".{0,25}?" + FLOAT_RE, re.IGNORECASE | re.DOTALL)
-            m = rx.search(t)
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    # Нормализованная и оригинальная версия — пара (norm, orig).
+    pairs = [(_normalize_cyr(ln), ln) for ln in raw_lines]
+
+    def _scan_value(idx: int, after_text: str, prefer_decimals: bool = True,
+                     min_value: float = 0.0, lookahead: int = 2):
+        """Ищем подходящее число: сначала на этой строке после якоря,
+        затем — в следующих lookahead строках полностью.
+        prefer_decimals=True — игнорируем целые числа (бар-чарт tick'и)."""
+        # на текущей строке
+        nums = _decimals_in(after_text) if prefer_decimals else _numbers_in(after_text)
+        cand = [n for n in nums if n >= min_value]
+        if cand:
+            return cand[0], "same_line"
+        # в lookahead-строках
+        for j in range(idx + 1, min(len(pairs), idx + 1 + lookahead)):
+            nums = _decimals_in(pairs[j][1])
+            cand = [n for n in nums if n >= min_value]
+            if cand:
+                return cand[0], f"next+{j-idx}"
+        return None, None
+
+    # Проход 1 — приоритетные якоря (по нормализованному тексту)
+    for i, (norm, orig) in enumerate(pairs):
+        # weight: «Идеальный Вес 79.3 kg»
+        if "weight_kg" not in metrics:
+            m = _LABEL_PATTERNS["ideal_weight"].search(norm) or _LABEL_PATTERNS["ideal_weight_glued"].search(norm)
             if m:
-                val = _to_float(m.group(1))
-                if val is not None:
-                    return val
-        return None
+                # после якоря — обычное (не только дробное) число ≥30
+                nums = _numbers_in(orig[m.end():])
+                cand = [n for n in nums if n >= 30.0]
+                if cand:
+                    try_set("weight_kg", cand[0], "anchor:ideal", orig.strip())
 
-    weight = find_metric("weight")
-    pbf = find_metric("pbf")
-    smm = find_metric("smm")
+        if "pbf_percent" not in metrics:
+            m = _LABEL_PATTERNS["pbf_full"].search(norm)
+            if m:
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=2.0)
+                if v is not None:
+                    try_set("pbf_percent", v, f"anchor:pbf_full({src})", orig.strip())
 
-    # fallback: иногда InBody пишет значения без рядом стоящих слов,
-    # поэтому пытаемся по наиболее вероятным диапазонам.
-    all_nums = [_to_float(x) for x in re.findall(FLOAT_RE, t)]
-    all_nums = [x for x in all_nums if x is not None]
+        if "smm_kg" not in metrics:
+            m = _LABEL_PATTERNS["smm_full"].search(norm)
+            if m:
+                # значение почти всегда на следующей строке — пропускаем tick'и
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=10.0)
+                if v is not None:
+                    try_set("smm_kg", v, f"anchor:smm_full({src})", orig.strip())
 
-    if weight is None:
-        # типичный вес 35..200
-        candidates = [x for x in all_nums if 35 <= x <= 200]
-        if candidates:
-            weight = max(candidates)  # часто вес — самое большое число
+    # Проход 1.5 — если SMM не нашли, ищем по «мускулатуры»: на этой же строке
+    # должно быть дробное число.
+    if "smm_kg" not in metrics:
+        for i, (norm, orig) in enumerate(pairs):
+            m = _LABEL_PATTERNS["smm_continuation"].search(norm)
+            if m:
+                nums = _decimals_in(orig)
+                cand = [n for n in nums if 10.0 <= n <= 80.0]
+                if cand:
+                    try_set("smm_kg", cand[0], "anchor:smm_cont", orig.strip())
+                    if "smm_kg" in metrics:
+                        break
 
-    if pbf is None:
-        # жир 3..60
-        candidates = [x for x in all_nums if 3 <= x <= 60]
-        if candidates:
-            pbf = min(candidates) if len(candidates) > 1 else candidates[0]
+    # Проход 2 — генерики по таблице «История состава тела»:
+    # короткие строки «Вес (kg) 79.3» / «(kg) 41.7».
+    if "weight_kg" not in metrics:
+        for i, (norm, orig) in enumerate(pairs):
+            if _LABEL_PATTERNS["weight_short"].search(norm):
+                v, src = _scan_value(i, orig, prefer_decimals=False, min_value=30.0)
+                if v is not None:
+                    try_set("weight_kg", v, f"generic:weight_short({src})", orig.strip())
+                    break
 
-    if smm is None:
-        # мышцы 15..80
-        candidates = [x for x in all_nums if 15 <= x <= 80]
-        # исключим вес
-        if weight is not None:
-            candidates = [x for x in candidates if abs(x - weight) > 3]
-        if candidates:
-            smm = max(candidates)
+    if "pbf_percent" not in metrics:
+        for i, (norm, orig) in enumerate(pairs):
+            m = _LABEL_PATTERNS["pbf_short"].search(norm)
+            if m:
+                v, src = _scan_value(i, orig[m.end():], prefer_decimals=True, min_value=2.0)
+                if v is not None:
+                    try_set("pbf_percent", v, f"generic:pbf_short({src})", orig.strip())
+                    if "pbf_percent" in metrics:
+                        break
 
-    if weight is not None:
-        found["weight_kg"] = round(float(weight), 1)
-    if pbf is not None:
-        found["pbf_percent"] = round(float(pbf), 1)
-    if smm is not None:
-        found["smm_kg"] = round(float(smm), 1)
-
-    score = 0
-    if "weight_kg" in found:
-        score += 1
-    if "pbf_percent" in found:
-        score += 1
-    if "smm_kg" in found:
-        score += 1
-
-    return found, score
+    return metrics, debug
 
 
-def run_inbody_ocr(image_path: str, use_gpu: bool = False):
-    """
-    Основная функция:
-    - загружает фото
-    - делает preprocessing + несколько OCR попыток
-    - выбирает лучший результат по числу найденных метрик
-    """
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def run_inbody_ocr(image_path: str, use_gpu: bool = False) -> dict:
     if not os.path.exists(image_path):
         return {"ok": False, "error": "Файл не найден"}
-
     img_bgr = cv2.imread(image_path)
     if img_bgr is None:
         return {"ok": False, "error": "Не удалось прочитать изображение"}
-
-    # init Paddle once
-    paddle = None
-    if PaddleOCR is not None:
-        try:
-            paddle = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=use_gpu)
-        except Exception:
-            paddle = None
-
-    variants = _preprocess_variants(img_bgr)
+    if pytesseract is None:
+        return {"ok": False, "error": "Tesseract не установлен"}
 
     best = {
-        "score": -1,
         "metrics": {},
-        "text": "",
+        "raw": "",
         "variant": "",
-        "engine": "",
+        "psm": 6,
+        "score": -1.0,
+        "debug": {},
     }
 
-    for name, imgv in variants:
-        # PaddleOCR
-        if paddle is not None:
-            text = _paddle_ocr_text(paddle, imgv)
-            metrics, score = parse_inbody_metrics(text)
+    # Сливаем всё, что нашли разные варианты OCR — берём лучший по числу метрик.
+    for vname, imgv in _preprocess_variants(img_bgr):
+        for psm in (6, 4):
+            txt = _tesseract_text(imgv, psm=psm)
+            if not txt.strip():
+                continue
+            m, d = parse_inbody_text(txt)
+            score = float(sum(1 for k in ("weight_kg", "pbf_percent", "smm_kg") if k in m))
+            score += sum(
+                0.5 for v in d.values()
+                if isinstance(v, dict) and str(v.get("source", "")).startswith("anchor")
+            )
             if score > best["score"]:
-                best.update({
-                    "score": score,
-                    "metrics": metrics,
-                    "text": text,
-                    "variant": name,
-                    "engine": "paddle",
-                })
+                best = {"metrics": m, "raw": txt, "variant": vname, "psm": psm,
+                        "score": score, "debug": d}
 
-        # Tesseract fallback
-        text2 = _tesseract_text(imgv)
-        metrics2, score2 = parse_inbody_metrics(text2)
-        if score2 > best["score"]:
-            best.update({
-                "score": score2,
-                "metrics": metrics2,
-                "text": text2,
-                "variant": name,
-                "engine": "tesseract",
-            })
+    metrics = best["metrics"]
+    conf = 0.0
+    for k in ("weight_kg", "pbf_percent", "smm_kg"):
+        if k in metrics:
+            conf += 0.33
+            src = best["debug"].get(k, {}).get("source", "")
+            if str(src).startswith("anchor"):
+                conf += 0.04
+    conf = round(min(1.0, conf), 2)
 
-    confidence = min(1.0, best["score"] / 3.0)
+    # Дата печатается в шапке отчёта — пытаемся вытащить из лучшего варианта,
+    # а также из всех вариантов, если в основном дата не нашлась.
+    test_date = _try_extract_date(best["raw"] or "")
+    if not test_date:
+        # fallback: ещё раз прогнать orig PSM=6 — он лучше для шапки
+        for vname, imgv in _preprocess_variants(img_bgr):
+            if vname != "orig":
+                continue
+            txt = _tesseract_text(imgv, psm=6)
+            test_date = _try_extract_date(txt)
+            if test_date:
+                break
 
     return {
         "ok": True,
-        "metrics": best["metrics"],
-        "confidence": confidence,
-        "raw_text": best["text"][:4000],
-        "debug": {"variant": best["variant"], "engine": best["engine"], "score": best["score"]},
+        "metrics": metrics,
+        "confidence": conf,
+        "test_date": test_date,
+        "raw_text": (best["raw"] or "")[:4000],
+        "debug": {
+            "variant": best["variant"],
+            "psm": best["psm"],
+            "score": best["score"],
+            "engine": "tesseract-rus+eng",
+            "matches": best["debug"],
+        },
     }
