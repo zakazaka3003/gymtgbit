@@ -242,6 +242,12 @@ class WorkoutFSM(StatesGroup):
     in_workout = State()
 
 
+class TemplateFSM(StatesGroup):
+    new_name = State()
+    add_search = State()
+    rename = State()
+
+
 # -------------------------
 # UI helpers
 # -------------------------
@@ -294,8 +300,8 @@ def main_menu_inline() -> InlineKeyboardMarkup:
         rows.append([wb])
     rows += [
         [btn("📊 Дашборд", "open_dashboard"), btn("📷 Замер", "open_inbody")],
-        [btn("🏋️ Тренировка", "open_workout"), btn("💪 Силовые", "open_strength")],
-        [btn("📈 Аналитика", "open_analytics"), btn("🏆 Рекорды", "strength_pr")],
+        [btn("🏋️ Тренировка", "open_workout"), btn("🏆 Рекорды", "open_strength")],
+        [btn("📈 Аналитика", "open_analytics"), btn("📚 Упражнения", "ex_list")],
         [btn("👤 Профиль", "open_profile"), btn("⚙️ Настройки", "open_settings")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -344,8 +350,7 @@ def webapp_inline_kb() -> Optional[InlineKeyboardMarkup]:
 
 def profile_menu_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("👁️ Посмотреть", "profile_view"), btn("✏️ Изменить", "profile_edit")],
-        [btn("🎯 Цели", "profile_goals")],
+        [btn("✏️ Изменить", "profile_edit"), btn("🎯 Цели", "profile_goals")],
         [btn("🗑 Удалить все данные", "wipe_all", style="danger")],
         [btn("🏠 Меню", "go_main_menu")],
     ])
@@ -369,24 +374,24 @@ def inbody_add_mode_inline() -> InlineKeyboardMarkup:
 
 def strength_menu_inline() -> InlineKeyboardMarkup:
     return with_back_home([
-        [btn("➕ Записать результат", "strength_add", style="success")],
-        [btn("🏆 Рекорды", "strength_pr"), btn("📚 Все", "ex_list")],
+        [btn("➕ Записать рекорд", "strength_add", style="success")],
+        [btn("📚 Упражнения", "ex_list")],
     ])
 
 
 def workout_menu_inline() -> InlineKeyboardMarkup:
     return with_back_home([
         [btn("▶️ Начать тренировку", "workout_start", style="primary")],
+        [btn("📋 По шаблону", "tpl_pick"), btn("🛠 Шаблоны", "tpl_list")],
         [btn("🧾 История", "workout_history")],
     ])
 
 
 def analytics_menu_inline() -> InlineKeyboardMarkup:
     return with_back_home([
-        [btn("📄 Замеры тела", "an_body")],
-        [btn("💪 Силовые", "an_strength")],
-        [btn("🧩 Общий прогресс", "an_total")],
-        [btn("🔮 Прогноз 30 дней", "an_forecast")],
+        [btn("📊 Вес", "an_weight"), btn("💧 % жира", "an_pbf")],
+        [btn("💪 Мышцы", "an_smm"), btn("🏋️ Сила", "an_strength")],
+        [btn("📋 Сводка", "an_summary")],
     ])
 
 
@@ -415,7 +420,7 @@ def ocr_confirm_inline() -> InlineKeyboardMarkup:
 
 def workout_after_set_inline() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("➕ Ещё подход", "wo_more", style="primary")],
+        [btn("➕ Ещё подход", "wo_more_set", style="primary")],
         [btn("➡️ Сменить упражнение", "wo_end_ex"), btn("🏁 Завершить", "wo_finish", style="success")],
     ])
 
@@ -687,6 +692,32 @@ CREATE TABLE IF NOT EXISTS workout_items (
 
 CREATE INDEX IF NOT EXISTS idx_workout_items_workout
 ON workout_items(workout_id, exercise_id);
+
+CREATE TABLE IF NOT EXISTS workout_templates (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_templates_user
+ON workout_templates(user_id, is_active);
+
+CREATE TABLE IF NOT EXISTS workout_template_items (
+    id INTEGER PRIMARY KEY,
+    template_id INTEGER NOT NULL,
+    exercise_id INTEGER NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    target_sets INTEGER,
+    target_reps INTEGER,
+    FOREIGN KEY(template_id) REFERENCES workout_templates(id) ON DELETE CASCADE,
+    FOREIGN KEY(exercise_id) REFERENCES exercises(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_template_items_tpl
+ON workout_template_items(template_id, position);
 """
 
 async def fetchone(db: aiosqlite.Connection, query: str, params=()):
@@ -905,13 +936,105 @@ async def db_workout_finish(db, workout_id: int):
 
 async def db_workout_history(db, user_id: int, limit: int = 10):
     rows = await fetchall(db,"""
-        SELECT workout_date, group_name, total_sets, total_reps, total_tonnage
+        SELECT id, workout_date, group_name, total_sets, total_reps, total_tonnage
         FROM workouts
         WHERE user_id=?
         ORDER BY workout_date DESC, id DESC
         LIMIT ?
     """, (user_id, limit))
     return rows
+
+
+async def db_workout_get(db, workout_id: int, user_id: int):
+    return await fetchone(db, """
+        SELECT id, workout_date, group_name, total_sets, total_reps, total_tonnage
+        FROM workouts WHERE id=? AND user_id=?
+    """, (workout_id, user_id))
+
+
+async def db_workout_items_full(db, workout_id: int):
+    return await fetchall(db, """
+        SELECT wi.id, wi.exercise_id, e.name, wi.set_no, wi.weight, wi.reps
+        FROM workout_items wi
+        JOIN exercises e ON e.id=wi.exercise_id
+        WHERE wi.workout_id=?
+        ORDER BY wi.id ASC
+    """, (workout_id,))
+
+
+async def db_workout_delete(db, workout_id: int, user_id: int):
+    await db.execute("DELETE FROM workouts WHERE id=? AND user_id=?", (workout_id, user_id))
+    await db.commit()
+
+
+# -------- Workout Templates --------
+async def db_template_create(db, user_id: int, name: str) -> int:
+    cur = await db.execute("""
+        INSERT INTO workout_templates(user_id, name) VALUES(?, ?)
+    """, (user_id, name))
+    await db.commit()
+    return cur.lastrowid
+
+
+async def db_template_list(db, user_id: int):
+    return await fetchall(db, """
+        SELECT t.id, t.name, COUNT(ti.id) AS n_items
+        FROM workout_templates t
+        LEFT JOIN workout_template_items ti ON ti.template_id=t.id
+        WHERE t.user_id=? AND t.is_active=1
+        GROUP BY t.id, t.name
+        ORDER BY t.created_at DESC
+    """, (user_id,))
+
+
+async def db_template_get(db, template_id: int, user_id: int):
+    return await fetchone(db, """
+        SELECT id, name FROM workout_templates
+        WHERE id=? AND user_id=? AND is_active=1
+    """, (template_id, user_id))
+
+
+async def db_template_items(db, template_id: int):
+    return await fetchall(db, """
+        SELECT ti.id, ti.exercise_id, e.name, ti.position
+        FROM workout_template_items ti
+        JOIN exercises e ON e.id=ti.exercise_id
+        WHERE ti.template_id=?
+        ORDER BY ti.position ASC, ti.id ASC
+    """, (template_id,))
+
+
+async def db_template_add_item(db, template_id: int, exercise_id: int):
+    row = await fetchone(db, """
+        SELECT COALESCE(MAX(position), -1) + 1
+        FROM workout_template_items WHERE template_id=?
+    """, (template_id,))
+    pos = int(row[0]) if row else 0
+    await db.execute("""
+        INSERT INTO workout_template_items(template_id, exercise_id, position)
+        VALUES(?, ?, ?)
+    """, (template_id, exercise_id, pos))
+    await db.commit()
+
+
+async def db_template_remove_item(db, item_id: int):
+    await db.execute("DELETE FROM workout_template_items WHERE id=?", (item_id,))
+    await db.commit()
+
+
+async def db_template_rename(db, template_id: int, user_id: int, new_name: str):
+    await db.execute("""
+        UPDATE workout_templates SET name=? WHERE id=? AND user_id=?
+    """, (new_name, template_id, user_id))
+    await db.commit()
+
+
+async def db_template_delete(db, template_id: int, user_id: int):
+    # soft-delete to avoid breaking referenced items
+    await db.execute("""
+        UPDATE workout_templates SET is_active=0 WHERE id=? AND user_id=?
+    """, (template_id, user_id))
+    await db.commit()
 
 
 async def db_wipe_all(db, user_id: int):
@@ -1088,7 +1211,18 @@ async def go_main_menu(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "open_profile")
 async def open_profile(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(cb.message, "👤 <b>Профиль</b>", reply_markup=profile_menu_inline())
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        p = await db_get_profile(db, user_id)
+    if not p:
+        await safe_edit(
+            cb.message,
+            "👤 <b>Профиль ещё не заполнен.</b>\n\nНажми /start, чтобы пройти короткий опрос.",
+            reply_markup=back_to_menu_inline(),
+        )
+        await cb.answer()
+        return
+    await safe_edit(cb.message, pretty_profile_card(p), reply_markup=profile_menu_inline())
     await cb.answer()
 
 
@@ -1102,7 +1236,25 @@ async def open_inbody(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "open_strength")
 async def open_strength(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(cb.message, "💪 <b>Силовые</b>", reply_markup=strength_menu_inline())
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        rows = await db_strength_pr(db, user_id)
+    if not rows:
+        text = (
+            "🏆 <b>Рекорды</b>\n\n"
+            "Пока нет записей. Жми <b>➕ Записать рекорд</b>, чтобы добавить первый результат."
+        )
+    else:
+        text = "🏆 <b>Мои рекорды</b>\n\n"
+        for r in rows[:15]:
+            name, best_weight, best_e1rm, best_vol = r
+            text += (
+                f"• <b>{H(name)}</b> — <b>{best_weight:.1f}</b> кг "
+                f"<i>(1RM≈{best_e1rm:.1f})</i>\n"
+            )
+        if len(rows) > 15:
+            text += f"\n<i>… и ещё {len(rows) - 15}</i>"
+    await safe_edit(cb.message, text, reply_markup=strength_menu_inline())
     await cb.answer()
 
 
@@ -1932,31 +2084,9 @@ async def strength_enter_reps(message: Message, state: FSMContext):
 
 
 @dp.callback_query(F.data == "strength_pr")
-async def strength_pr(cb: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        user_id = await db_get_user_id(db, cb.from_user.id)
-        rows = await db_strength_pr(db, user_id)
-
-    if not rows:
-        await safe_edit(
-            cb.message,
-            "🏆 Пока нет записей. Добавь первый результат 🙂",
-            reply_markup=strength_menu_inline(),
-        )
-        await cb.answer()
-        return
-
-    text = "🏆 <b>Мои рекорды</b>\n\n"
-    for r in rows:
-        name, best_weight, best_e1rm, best_vol = r
-        text += (
-            f"• <b>{H(name)}</b>\n"
-            f"  · лучший вес: <b>{best_weight:.1f}</b> кг\n"
-            f"  · лучший 1RM: <b>{best_e1rm:.1f}</b> кг\n"
-            f"  · лучший объём: <b>{best_vol:.0f}</b>\n\n"
-        )
-    await safe_edit(cb.message, text, reply_markup=strength_menu_inline())
-    await cb.answer()
+async def strength_pr(cb: CallbackQuery, state: FSMContext):
+    # backward-compat alias for old messages
+    await open_strength(cb, state)
 
 
 @dp.callback_query(F.data == "strength_chart")
@@ -2126,6 +2256,8 @@ class WorkoutSession:
     current_exercise_id: int = None
     current_exercise_name: str = ""
     set_no: int = 0
+    template_queue: list = None
+    template_name: str = ""
 
 # in-memory sessions
 SESSIONS = {}
@@ -2320,6 +2452,11 @@ async def wo_more_set(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(WorkoutFSM.in_workout, F.data == "wo_end_ex")
 async def wo_end_ex(cb: CallbackQuery, state: FSMContext):
+    sess = SESSIONS.get(cb.from_user.id)
+    if sess and sess.template_queue:
+        await _start_next_template_exercise(cb.message, cb.from_user.id, state, edit=False)
+        await cb.answer()
+        return
     await state.set_state(WorkoutFSM.choose_group)
     await cb.message.answer(
         "Упражнение завершено ✅\nНапиши название следующего упражнения, например: <code>тяга</code>",
@@ -2358,7 +2495,7 @@ async def wo_finish(cb: CallbackQuery, state: FSMContext):
 async def workout_history(cb: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         user_id = await db_get_user_id(db, cb.from_user.id)
-        rows = await db_workout_history(db, user_id)
+        rows = await db_workout_history(db, user_id, limit=15)
 
     if not rows:
         await safe_edit(
@@ -2369,14 +2506,413 @@ async def workout_history(cb: CallbackQuery):
         await cb.answer()
         return
 
-    text = "🧾 <b>История тренировок</b>\n\n"
+    text = "🧾 <b>История</b> — нажми на тренировку, чтобы посмотреть или удалить."
+    kb = []
     for r in rows:
-        text += (
-            f"📅 <b>{H(r[0])}</b> · {H(r[1])}\n"
-            f"· подходы: {r[2]} | повторы: {r[3]} | тоннаж: {r[4]:.0f} кг\n\n"
-        )
-    await safe_edit(cb.message, text, reply_markup=workout_menu_inline())
+        wid, date, group, sets, reps_, tonn = r
+        label = f"📅 {date} · {group} · {sets}×{reps_}, {tonn:.0f}кг"
+        kb.append([btn(label[:60], f"wh_view:{wid}")])
+    kb.append([btn("⬅️ Назад", "open_workout"), btn("🏠 Меню", "go_main_menu")])
+    await safe_edit(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("wh_view:"))
+async def wh_view(cb: CallbackQuery):
+    workout_id = int(cb.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        w = await db_workout_get(db, workout_id, user_id)
+        items = await db_workout_items_full(db, workout_id) if w else []
+    if not w:
+        await cb.answer("Не найдено")
+        return
+    _, date, group, sets, reps_, tonn = w
+    text = (
+        f"📅 <b>{H(date)}</b> · {H(group)}\n"
+        f"подходы: {sets} | повторы: {reps_} | тоннаж: {tonn:.0f} кг\n"
+    )
+    if items:
+        cur_ex = None
+        for it in items:
+            iid, ex_id, name, set_no, w_, reps_v = it
+            if name != cur_ex:
+                cur_ex = name
+                text += f"\n<b>{H(name)}</b>\n"
+            text += f"  · сет {set_no}: <b>{w_:.1f}</b> кг × <b>{reps_v}</b>\n"
+    else:
+        text += "\n<i>Подходы не записаны.</i>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("🗑 Удалить тренировку", f"wh_del:{workout_id}", style="danger")],
+        [btn("⬅️ К истории", "workout_history"), btn("🏠 Меню", "go_main_menu")],
+    ])
+    await safe_edit(cb.message, text, reply_markup=kb)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("wh_del:"))
+async def wh_del(cb: CallbackQuery):
+    workout_id = int(cb.data.split(":")[1])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("✅ Да, удалить", f"wh_del_yes:{workout_id}", style="danger")],
+        [btn("⬅️ Отмена", f"wh_view:{workout_id}")],
+    ])
+    await safe_edit(
+        cb.message,
+        "⚠️ <b>Удалить эту тренировку?</b>\nЭто действие нельзя отменить.",
+        reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("wh_del_yes:"))
+async def wh_del_yes(cb: CallbackQuery):
+    workout_id = int(cb.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        await db_workout_delete(db, workout_id, user_id)
+    await safe_edit(
+        cb.message,
+        "🗑 Тренировка удалена.",
+        reply_markup=workout_menu_inline(),
+    )
+    await cb.answer("Удалено")
+
+
+# -------------------------
+# Workout Templates UX
+# -------------------------
+@dp.callback_query(F.data == "tpl_list")
+async def tpl_list(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        rows = await db_template_list(db, user_id)
+    text = (
+        "🛠 <b>Шаблоны тренировок</b>\n\n"
+        "Свои программы — собери раз и запускай в один клик."
+    )
+    kb = []
+    if rows:
+        for r in rows:
+            tpl_id, name, n_items = r
+            kb.append([btn(f"{name} · {n_items} упр.", f"tpl_edit:{tpl_id}")])
+    else:
+        text += "\n\n<i>Пока нет шаблонов. Создай первый.</i>"
+    kb.append([btn("➕ Создать шаблон", "tpl_new", style="success")])
+    kb.append([btn("⬅️ Назад", "open_workout"), btn("🏠 Меню", "go_main_menu")])
+    await safe_edit(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "tpl_pick")
+async def tpl_pick(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        rows = await db_template_list(db, user_id)
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [btn("➕ Создать шаблон", "tpl_new", style="success")],
+            [btn("⬅️ Назад", "open_workout")],
+        ])
+        await safe_edit(
+            cb.message,
+            "📋 У тебя пока нет шаблонов.\nСобери свой — упражнения, нужный порядок.",
+            reply_markup=kb,
+        )
+        await cb.answer()
+        return
+    kb = []
+    for r in rows:
+        tpl_id, name, n_items = r
+        kb.append([btn(f"▶️ {name} ({n_items})", f"tpl_run:{tpl_id}", style="primary")])
+    kb.append([btn("⬅️ Назад", "open_workout"), btn("🏠 Меню", "go_main_menu")])
+    await safe_edit(
+        cb.message,
+        "📋 <b>Выбери шаблон для запуска:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "tpl_new")
+async def tpl_new(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TemplateFSM.new_name)
+    await safe_edit(
+        cb.message,
+        "➕ <b>Новый шаблон</b>\n\n"
+        "Напиши название (например: <code>Push</code>, <code>Ноги</code>, <code>Понедельник</code>).",
+        reply_markup=cancel_fsm_inline(),
+    )
+    await cb.answer()
+
+
+@dp.message(TemplateFSM.new_name)
+async def tpl_new_name_input(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if len(name) < 2 or len(name) > 60:
+        await message.answer("Название от 2 до 60 символов. Попробуй ещё раз.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, message.from_user.id)
+        tpl_id = await db_template_create(db, user_id, name)
+    await state.clear()
+    await message.answer(
+        f"✅ Шаблон «<b>{H(name)}</b>» создан. Теперь добавь упражнения.",
+        reply_markup=await _tpl_edit_kb(tpl_id),
+    )
+
+
+async def _tpl_edit_kb(template_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("➕ Добавить упражнение", f"tpl_add:{template_id}", style="success")],
+        [btn("✏️ Переименовать", f"tpl_ren:{template_id}")],
+        [btn("▶️ Запустить", f"tpl_run:{template_id}", style="primary")],
+        [btn("🗑 Удалить шаблон", f"tpl_del:{template_id}", style="danger")],
+        [btn("⬅️ К списку", "tpl_list"), btn("🏠 Меню", "go_main_menu")],
+    ])
+
+
+async def _tpl_edit_text(db, template_id: int, user_id: int) -> str | None:
+    tpl = await db_template_get(db, template_id, user_id)
+    if not tpl:
+        return None
+    items = await db_template_items(db, template_id)
+    text = f"🛠 <b>{H(tpl[1])}</b>\n\n"
+    if items:
+        for i, it in enumerate(items, 1):
+            iid, ex_id, name, pos = it
+            text += f"{i}. {H(name)}\n"
+    else:
+        text += "<i>Пока нет упражнений. Добавь первое.</i>"
+    return text
+
+
+@dp.callback_query(F.data.startswith("tpl_edit:"))
+async def tpl_edit(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    template_id = int(cb.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        text = await _tpl_edit_text(db, template_id, user_id)
+        items = await db_template_items(db, template_id)
+    if text is None:
+        await cb.answer("Не найдено")
+        return
+    kb_rows = []
+    for it in items:
+        iid, ex_id, name, pos = it
+        kb_rows.append([btn(f"🗑 {name[:40]}", f"tpl_item_del:{template_id}:{iid}", style="danger")])
+    base_kb = await _tpl_edit_kb(template_id)
+    kb_rows.extend(base_kb.inline_keyboard)
+    await safe_edit(cb.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("tpl_add:"))
+async def tpl_add(cb: CallbackQuery, state: FSMContext):
+    template_id = int(cb.data.split(":")[1])
+    await state.clear()
+    await state.set_state(TemplateFSM.add_search)
+    await state.update_data(template_id=template_id)
+    await safe_edit(
+        cb.message,
+        "➕ Напиши название упражнения для добавления в шаблон, например: <code>жим</code>, <code>присед</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("⬅️ Назад", f"tpl_edit:{template_id}"), btn("❌ Отмена", "go_main_menu", style="danger")],
+        ]),
+    )
+    await cb.answer()
+
+
+@dp.message(TemplateFSM.add_search)
+async def tpl_add_search(message: Message, state: FSMContext):
+    data = await state.get_data()
+    template_id = data.get("template_id")
+    if not template_id:
+        await state.clear()
+        await message.answer("Сессия редактирования потеряна, начни заново.")
+        return
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Напиши название упражнения, например: <code>жим</code>")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, message.from_user.id)
+        rows = await db_list_exercises(db, user_id, None)
+    matches = _search_exercises(rows, query, limit=5)
+    kb = []
+    if matches:
+        for r in matches:
+            ex_id, cat, name, is_custom, owner = r
+            kb.append([btn(name, f"tpl_pick_ex:{template_id}:{ex_id}")])
+        text = f"🔎 По «<b>{H(query)}</b>» нашёл варианты — выбери, что добавить:"
+    else:
+        text = f"🔎 По «<b>{H(query)}</b>» ничего не нашлось. Попробуй другое слово."
+    kb.append([btn("⬅️ Назад", f"tpl_edit:{template_id}"), btn("❌ Отмена", "go_main_menu", style="danger")])
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("tpl_pick_ex:"))
+async def tpl_pick_ex(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    template_id = int(parts[1])
+    exercise_id = int(parts[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db_template_add_item(db, template_id, exercise_id)
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        text = await _tpl_edit_text(db, template_id, user_id)
+        items = await db_template_items(db, template_id)
+    await state.clear()
+    if text is None:
+        await cb.answer("Не найдено")
+        return
+    kb_rows = []
+    for it in items:
+        iid, ex_id, name, pos = it
+        kb_rows.append([btn(f"🗑 {name[:40]}", f"tpl_item_del:{template_id}:{iid}", style="danger")])
+    base_kb = await _tpl_edit_kb(template_id)
+    kb_rows.extend(base_kb.inline_keyboard)
+    await safe_edit(cb.message, "✅ Добавлено.\n\n" + text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await cb.answer("Добавлено")
+
+
+@dp.callback_query(F.data.startswith("tpl_item_del:"))
+async def tpl_item_del(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    template_id = int(parts[1])
+    item_id = int(parts[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db_template_remove_item(db, item_id)
+    await tpl_edit(cb, state)
+
+
+@dp.callback_query(F.data.startswith("tpl_ren:"))
+async def tpl_ren(cb: CallbackQuery, state: FSMContext):
+    template_id = int(cb.data.split(":")[1])
+    await state.clear()
+    await state.set_state(TemplateFSM.rename)
+    await state.update_data(template_id=template_id)
+    await safe_edit(
+        cb.message,
+        "✏️ Напиши новое название шаблона:",
+        reply_markup=cancel_fsm_inline(),
+    )
+    await cb.answer()
+
+
+@dp.message(TemplateFSM.rename)
+async def tpl_ren_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    template_id = data.get("template_id")
+    name = (message.text or "").strip()
+    if not template_id:
+        await state.clear()
+        await message.answer("Сессия потеряна. Начни заново.")
+        return
+    if len(name) < 2 or len(name) > 60:
+        await message.answer("Название от 2 до 60 символов. Попробуй ещё раз.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, message.from_user.id)
+        await db_template_rename(db, template_id, user_id, name)
+    await state.clear()
+    await message.answer(
+        f"✅ Переименовано в «<b>{H(name)}</b>».",
+        reply_markup=await _tpl_edit_kb(template_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("tpl_del:"))
+async def tpl_del(cb: CallbackQuery):
+    template_id = int(cb.data.split(":")[1])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("✅ Да, удалить", f"tpl_del_yes:{template_id}", style="danger")],
+        [btn("⬅️ Отмена", f"tpl_edit:{template_id}")],
+    ])
+    await safe_edit(
+        cb.message,
+        "⚠️ <b>Удалить шаблон?</b>\nИстория тренировок не пострадает.",
+        reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("tpl_del_yes:"))
+async def tpl_del_yes(cb: CallbackQuery, state: FSMContext):
+    template_id = int(cb.data.split(":")[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        await db_template_delete(db, template_id, user_id)
+    await tpl_list(cb, state)
+
+
+@dp.callback_query(F.data.startswith("tpl_run:"))
+async def tpl_run(cb: CallbackQuery, state: FSMContext):
+    template_id = int(cb.data.split(":")[1])
+    await state.clear()
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        tpl = await db_template_get(db, template_id, user_id)
+        items = await db_template_items(db, template_id) if tpl else []
+        if not tpl or not items:
+            await safe_edit(
+                cb.message,
+                "В шаблоне нет упражнений — добавь хотя бы одно перед запуском.",
+                reply_markup=workout_menu_inline(),
+            )
+            await cb.answer()
+            return
+        workout_id = await db_workout_create(db, user_id, today_ymd(), tpl[1])
+
+    queue = [(it[1], it[2]) for it in items]  # (exercise_id, name)
+    sess = WorkoutSession(
+        workout_id=workout_id,
+        group=tpl[1],
+        template_queue=queue,
+        template_name=tpl[1],
+    )
+    SESSIONS[cb.from_user.id] = sess
+    await _start_next_template_exercise(cb.message, cb.from_user.id, state, edit=True)
+    await cb.answer()
+
+
+async def _start_next_template_exercise(message_or_cb_msg: Message, user_id_tg: int, state: FSMContext, *, edit: bool = False):
+    sess = SESSIONS.get(user_id_tg)
+    if not sess:
+        return
+    if not sess.template_queue:
+        # template finished — fall back to free choose
+        await state.set_state(WorkoutFSM.choose_group)
+        text = (
+            "🏁 Шаблон закончен.\n\nДобавишь ещё упражнение или закончим тренировку?"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✅ Завершить тренировку", "wo_finish", style="success")],
+        ])
+        if edit:
+            await safe_edit(message_or_cb_msg, text, reply_markup=kb)
+        else:
+            await message_or_cb_msg.answer(text, reply_markup=kb)
+        return
+    ex_id, name = sess.template_queue.pop(0)
+    sess.current_exercise_id = ex_id
+    sess.current_exercise_name = name
+    sess.set_no = 0
+    await state.set_state(WorkoutFSM.set_weight)
+    remaining = len(sess.template_queue)
+    text = (
+        f"📋 <b>{H(sess.template_name)}</b>\n"
+        f"🏋️ <b>{H(name)}</b>\n"
+        f"Подход <b>1</b> · введи вес (кг):\n"
+        f"<i>Осталось упражнений: {remaining}</i>"
+    )
+    if edit:
+        await safe_edit(message_or_cb_msg, text, reply_markup=cancel_fsm_inline())
+    else:
+        await message_or_cb_msg.answer(text, reply_markup=cancel_fsm_inline())
 
 
 @dp.callback_query(F.data == "workout_ai_tip")
@@ -2397,15 +2933,54 @@ async def workout_ai_tip(cb: CallbackQuery):
 # -------------------------
 # Analytics
 # -------------------------
-@dp.callback_query(F.data == "an_body")
-async def an_body(cb: CallbackQuery):
-    await safe_edit(
-        cb.message,
-        "📄 <b>Анализ замеров</b>\n\n"
-        "Графики доступны в «📄 Замеры → 📊 Графики».",
-        reply_markup=analytics_menu_inline(),
+async def _an_send_inbody_chart(cb: CallbackQuery, field_idx: int, title: str, ylabel: str, emoji: str):
+    """field_idx: 1=weight_kg, 2=pbf_percent, 3=smm_kg in db_inbody_all rows."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        rows = await db_inbody_all(db, user_id)
+
+    pts = [(r[0], r[field_idx]) for r in rows if r[field_idx] is not None]
+    if len(pts) < 2:
+        await safe_edit(
+            cb.message,
+            f"{emoji} <b>{H(title)}</b>\n\nНужно минимум 2 замера. Сейчас: {len(pts)}.",
+            reply_markup=analytics_menu_inline(),
+        )
+        await cb.answer()
+        return
+
+    dates = [d[5:] for d, _ in pts]
+    vals = [float(v) for _, v in pts]
+
+    first, last = vals[0], vals[-1]
+    delta = last - first
+    sign = "+" if delta >= 0 else ""
+    caption = (
+        f"{emoji} <b>{H(title)}</b>\n"
+        f"Сейчас: <b>{last:.1f}</b> {ylabel} · "
+        f"первое: {first:.1f} · "
+        f"Δ: <b>{sign}{delta:.1f}</b> {ylabel} ({len(pts)} замеров)"
     )
+
+    buf = plot_series(dates, vals, title, ylabel)
+    await cb.message.answer_photo(photo=buf, caption=caption)
+    await cb.message.answer("📈 <b>Аналитика</b>", reply_markup=analytics_menu_inline())
     await cb.answer()
+
+
+@dp.callback_query(F.data == "an_weight")
+async def an_weight(cb: CallbackQuery):
+    await _an_send_inbody_chart(cb, 1, "Вес", "кг", "📊")
+
+
+@dp.callback_query(F.data == "an_pbf")
+async def an_pbf(cb: CallbackQuery):
+    await _an_send_inbody_chart(cb, 2, "% жира", "%", "💧")
+
+
+@dp.callback_query(F.data == "an_smm")
+async def an_smm(cb: CallbackQuery):
+    await _an_send_inbody_chart(cb, 3, "Мышечная масса", "кг", "💪")
 
 
 @dp.callback_query(F.data == "an_strength")
@@ -2423,7 +2998,7 @@ async def an_strength(cb: CallbackQuery):
         if not row:
             await safe_edit(
                 cb.message,
-                "💪 Нет данных по силовым. Запиши хотя бы 2 результата.",
+                "🏋️ <b>Сила</b>\n\nНет данных. Запиши хотя бы 2 результата в «🏆 Рекорды».",
                 reply_markup=analytics_menu_inline(),
             )
             await cb.answer()
@@ -2439,41 +3014,95 @@ async def an_strength(cb: CallbackQuery):
             ORDER BY record_date ASC
         """, (user_id, ex_id))
 
+    if len(rows) < 2:
+        await safe_edit(
+            cb.message,
+            f"🏋️ <b>Сила</b>\n\nДля графика «{H(ex_name)}» нужно минимум 2 записи.",
+            reply_markup=analytics_menu_inline(),
+        )
+        await cb.answer()
+        return
+
     dates = [r[0][5:] for r in rows]
-    e1rm = [r[1] * (1 + r[2]/30.0) for r in rows]
+    e1rm = [r[1] * (1 + r[2] / 30.0) for r in rows]
 
-    buf = plot_series(dates, e1rm, f"Силовые: {ex_name} (1RM)", "кг")
-    await cb.message.answer_photo(photo=buf, caption=f"💪 Прогресс (1RM): <b>{H(ex_name)}</b>")
-    await cb.message.answer(
-        "<i>Больше графиков появится, когда добавишь больше упражнений.</i>",
-        reply_markup=analytics_menu_inline(),
+    delta = e1rm[-1] - e1rm[0]
+    sign = "+" if delta >= 0 else ""
+    caption = (
+        f"🏋️ <b>{H(ex_name)}</b> · 1RM\n"
+        f"Сейчас: <b>{e1rm[-1]:.1f}</b> кг · "
+        f"первое: {e1rm[0]:.1f} · Δ: <b>{sign}{delta:.1f}</b> кг ({len(rows)} записей)"
     )
+
+    buf = plot_series(dates, e1rm, f"Сила: {ex_name} (1RM)", "кг")
+    await cb.message.answer_photo(photo=buf, caption=caption)
+    await cb.message.answer("📈 <b>Аналитика</b>", reply_markup=analytics_menu_inline())
     await cb.answer()
 
 
-@dp.callback_query(F.data == "an_total")
-async def an_total(cb: CallbackQuery):
-    await safe_edit(
-        cb.message,
-        "🧩 <b>Общий прогресс</b>\n\n"
-        "• Тренировки ≥ 3/нед + сон\n"
-        "• Белок и прогрессия нагрузок\n"
-        "• Замеры каждые 7–14 дней\n\n"
-        "<i>Скоро добавим балльную оценку прогресса.</i>",
-        reply_markup=analytics_menu_inline(),
-    )
-    await cb.answer()
+def _delta_within(rows, days: int, field_idx: int):
+    """rows: list of (date_iso, ...). Возвращает (current, previous_in_window) или (None, None)."""
+    if not rows:
+        return None, None
+    last = rows[-1]
+    last_v = last[field_idx]
+    last_d = dt.date.fromisoformat(last[0])
+    cutoff = last_d - dt.timedelta(days=days)
+    prev_v = None
+    for r in rows:
+        if r[field_idx] is None:
+            continue
+        rd = dt.date.fromisoformat(r[0])
+        if rd <= cutoff:
+            prev_v = r[field_idx]
+        else:
+            break
+    return last_v, prev_v
 
 
-@dp.callback_query(F.data == "an_forecast")
-async def an_forecast(cb: CallbackQuery):
-    await safe_edit(
-        cb.message,
-        "🔮 <b>Прогноз на 30 дней</b>\n\n"
-        "• При стабильной программе прирост силы виден через <b>2–4 недели</b>.\n"
-        "• Замеры тела меняются медленнее — оценивай тренд минимум по 3 замерам.",
-        reply_markup=analytics_menu_inline(),
-    )
+@dp.callback_query(F.data == "an_summary")
+async def an_summary(cb: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        inbody = await db_inbody_all(db, user_id)
+        n_workouts_row = await fetchone(db, "SELECT COUNT(*) FROM workouts WHERE user_id=?", (user_id,))
+        n_workouts = n_workouts_row[0] if n_workouts_row else 0
+        tonnage_row = await fetchone(db, """
+            SELECT COALESCE(SUM(total_tonnage),0)
+            FROM workouts WHERE user_id=?
+        """, (user_id,))
+        total_tonnage = float(tonnage_row[0]) if tonnage_row else 0.0
+        n_pr_row = await fetchone(db, "SELECT COUNT(*) FROM strength_records WHERE user_id=?", (user_id,))
+        n_pr = n_pr_row[0] if n_pr_row else 0
+
+    lines = ["📋 <b>Сводка</b>\n"]
+    if inbody:
+        last_w, prev_w_7 = _delta_within(inbody, 7, 1)
+        last_w, prev_w_30 = _delta_within(inbody, 30, 1)
+        lines.append(f"⚖️ Вес: <b>{last_w:.1f}</b> кг" if last_w is not None else "⚖️ Вес: —")
+        if prev_w_7 is not None and last_w is not None:
+            d = last_w - prev_w_7
+            lines.append(f"  · 7 дней: {'+' if d >= 0 else ''}{d:.1f} кг")
+        if prev_w_30 is not None and last_w is not None:
+            d = last_w - prev_w_30
+            lines.append(f"  · 30 дней: {'+' if d >= 0 else ''}{d:.1f} кг")
+        last_pbf, _ = _delta_within(inbody, 30, 2)
+        last_smm, _ = _delta_within(inbody, 30, 3)
+        if last_pbf is not None:
+            lines.append(f"💧 % жира: <b>{last_pbf:.1f}%</b>")
+        if last_smm is not None:
+            lines.append(f"💪 Мышцы: <b>{last_smm:.1f}</b> кг")
+        lines.append(f"📷 Замеров всего: <b>{len(inbody)}</b>")
+    else:
+        lines.append("📷 Нет замеров — добавь первый.")
+
+    lines.append("")
+    lines.append(f"🏋️ Тренировок: <b>{n_workouts}</b>")
+    if total_tonnage > 0:
+        lines.append(f"  · общий тоннаж: <b>{total_tonnage:.0f}</b> кг")
+    lines.append(f"🏆 Записей силовых: <b>{n_pr}</b>")
+
+    await safe_edit(cb.message, "\n".join(lines), reply_markup=analytics_menu_inline())
     await cb.answer()
 
 
