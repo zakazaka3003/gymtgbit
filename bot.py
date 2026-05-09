@@ -69,43 +69,127 @@ DEFAULT_EXERCISES = {
     "Грудь": [
         "Жим лёжа (штанга)",
         "Жим лёжа (гантели)",
-        "Жим на наклонной скамье",
+        "Жим на наклонной скамье (штанга)",
+        "Жим на наклонной скамье (гантели)",
+        "Жим на скамье вниз головой",
+        "Жим в Хаммере",
+        "Жим в Смите",
+        "Сведения в кроссовере",
+        "Сведения в тренажёре «бабочка»",
         "Разводка гантелей лёжа",
+        "Разводка гантелей на наклонной",
+        "Отжимания от пола",
+        "Отжимания с весом",
         "Отжимания на брусьях",
+        "Пуловер с гантелью",
+        "Пуловер на блоке",
     ],
     "Спина": [
         "Подтягивания",
+        "Подтягивания с весом",
+        "Подтягивания обратным хватом",
+        "Подтягивания узким хватом",
         "Тяга верхнего блока",
+        "Тяга верхнего блока обратным хватом",
+        "Тяга верхнего блока узким хватом",
+        "Тяга горизонтального блока",
         "Тяга штанги в наклоне",
+        "Тяга штанги в наклоне обратным хватом",
+        "Тяга Т-грифа",
         "Тяга гантели одной рукой",
-        "Становая тяга",
+        "Тяга в Хаммере",
+        "Становая тяга (классика)",
+        "Становая тяга сумо",
+        "Становая тяга на прямых ногах",
+        "Шраги со штангой",
+        "Шраги с гантелями",
+        "Гиперэкстензия",
     ],
     "Ноги": [
         "Приседания со штангой",
+        "Фронтальный присед (штанга на груди)",
+        "Гоблет-присед (с гирей)",
         "Жим ногами",
-        "Румынская тяга",
-        "Выпады",
+        "Жим ногами одной ногой",
+        "Гак-присед",
+        "Болгарские выпады",
+        "Выпады с гантелями",
+        "Выпады со штангой",
+        "Ходьба выпадами",
         "Сгибания ног лёжа",
+        "Сгибания ног сидя",
         "Разгибания ног",
+        "Подъёмы на носки стоя",
+        "Подъёмы на носки сидя",
+        "Подъёмы на носки в жиме ногами",
+        "Румынская тяга",
+        "Махи гирей",
     ],
     "Плечи": [
-        "Жим штанги стоя",
+        "Жим штанги стоя (армейский)",
+        "Жим штанги сидя",
         "Жим гантелей сидя",
-        "Махи в стороны",
+        "Жим гантелей стоя",
+        "Жим Арнольда",
+        "Жим в Смите (плечи)",
+        "Махи гантелями в стороны",
+        "Махи в стороны (блок)",
         "Махи в наклоне",
+        "Махи перед собой",
+        "Подъёмы перед собой со штангой",
+        "Тяга к подбородку",
+        "Обратные разводки в тренажёре",
+        "Шраги стоя",
     ],
-    "Руки": [
+    "Бицепс": [
         "Сгибания на бицепс (штанга)",
         "Сгибания на бицепс (гантели)",
-        "Французский жим",
-        "Разгибания на блоке",
+        "Молотковые сгибания",
+        "Сгибания на скамье Скотта",
+        "Сгибания на блоке",
+        "Концентрированные сгибания",
+        "Сгибания на наклонной скамье",
+        "Сгибания обратным хватом",
+        "Сгибания с EZ-грифом",
     ],
-    "Полное тело": [
-        "Бёрпи",
+    "Трицепс": [
+        "Французский жим",
+        "Жим узким хватом",
+        "Разгибания на блоке (канат)",
+        "Разгибания на блоке (рукоять)",
+        "Разгибания из-за головы",
+        "Разгибания с гантелью одной рукой",
+        "Отжимания на брусьях (трицепс)",
+        "Кикбэк гантели",
+        "Алмазные отжимания",
+    ],
+    "Пресс": [
+        "Скручивания",
+        "Скручивания на наклонной скамье",
+        "Скручивания на блоке",
+        "Подъёмы ног в висе",
+        "Подъёмы ног лёжа",
         "Планка",
-        "Тяга гири",
-        "Приседания с гирей (goblet)",
-    ]
+        "Планка боковая",
+        "Велосипед",
+        "Складка лёжа",
+        "Молитва",
+        "Колесо для пресса",
+    ],
+    "Кардио": [
+        "Бёрпи",
+        "Скакалка",
+        "Гребля (тренажёр)",
+        "Велотренажёр",
+        "Беговая дорожка",
+        "Эллипс",
+        "Аэробайк (assault bike)",
+        "Прыжки на коробку",
+        "Турецкий подъём",
+        "Кеттлбелл-свинг",
+        "Рывок гири",
+        "Толчок гири",
+    ],
 }
 
 
@@ -137,8 +221,8 @@ class InBodyFSM(StatesGroup):
 
 
 class StrengthFSM(StatesGroup):
-    choose_category = State()
-    choose_exercise = State()
+    search_exercise = State()
+    add_custom_name = State()
     enter_weight = State()
     enter_reps = State()
 
@@ -286,15 +370,14 @@ def inbody_add_mode_inline() -> InlineKeyboardMarkup:
 def strength_menu_inline() -> InlineKeyboardMarkup:
     return with_back_home([
         [btn("➕ Записать результат", "strength_add", style="success")],
-        [btn("🏆 Рекорды (PR)", "strength_pr"), btn("📊 Графики", "an_strength")],
-        [btn("📚 Упражнения", "strength_exercises")],
+        [btn("🏆 Рекорды", "strength_pr"), btn("📚 Все", "ex_list")],
     ])
 
 
 def workout_menu_inline() -> InlineKeyboardMarkup:
     return with_back_home([
         [btn("▶️ Начать тренировку", "workout_start", style="primary")],
-        [btn("🧾 История", "workout_history"), btn("🧠 Совет (AI)", "workout_ai_tip")],
+        [btn("🧾 История", "workout_history")],
     ])
 
 
@@ -448,6 +531,52 @@ def pretty_profile_card(p):
 
 def today_ymd():
     return dt.date.today().strftime("%Y-%m-%d")
+
+
+# -------------------------
+# Exercise search (typeahead)
+# -------------------------
+def _norm_ex(s: str) -> str:
+    """Нормализуем строку: lowercase, ё→е, убираем пунктуацию."""
+    s = (s or "").casefold().replace("ё", "е")
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch.isspace():
+            out.append(ch)
+        else:
+            out.append(" ")
+    return " ".join("".join(out).split())
+
+
+def _score_match(query: str, name: str) -> float:
+    """Скоринг совпадения запроса и названия упражнения [0..1]."""
+    q = _norm_ex(query)
+    n = _norm_ex(name)
+    if not q or not n:
+        return 0.0
+    if q == n:
+        return 1.0
+    if n.startswith(q):
+        return 0.92 - min(0.2, len(n) * 0.001)
+    qwords = q.split()
+    if all(w in n for w in qwords):
+        return 0.78 - min(0.2, len(n) * 0.001)
+    if q in n:
+        return 0.65 - min(0.2, len(n) * 0.001)
+    from difflib import SequenceMatcher
+    ratio = SequenceMatcher(None, q, n).ratio()
+    return ratio * 0.55
+
+
+def _search_exercises(rows, query: str, limit: int = 6):
+    """rows: список (id, cat, name, is_custom, owner). Возвращает топ совпадений."""
+    scored = []
+    for r in rows:
+        s = _score_match(query, r[2])
+        if s >= 0.30:
+            scored.append((s, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
 
 
 # -------------------------
@@ -1659,23 +1788,18 @@ async def inbody_compare(cb: CallbackQuery):
 @dp.callback_query(F.data == "strength_add")
 async def strength_add(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await state.set_state(StrengthFSM.choose_category)
-
-    cats = list(DEFAULT_EXERCISES.keys()) + ["Своя"]
-    kb = []
-    row = []
-    for c in cats:
-        row.append(btn(c, f"st_cat:{c}"))
-        if len(row) == 2:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
-    kb.append([btn("⬅️ Назад", "open_strength"), btn("❌ Отмена", "go_main_menu", style="danger")])
+    await state.set_state(StrengthFSM.search_exercise)
     await safe_edit(
         cb.message,
-        "➕ <b>Новый рекорд</b>\n\nШаг 1/4 · выбери категорию:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        "➕ <b>Новый рекорд</b>\n\n"
+        "Напиши название упражнения, например:\n"
+        "• <code>жим</code> · <code>присед</code> · <code>тяга</code>\n"
+        "• <code>бицепс</code> · <code>планка</code>\n\n"
+        "Я подберу подходящие варианты.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("📚 Все упражнения", "ex_list")],
+            [btn("⬅️ Назад", "open_strength"), btn("❌ Отмена", "go_main_menu", style="danger")],
+        ]),
     )
     await cb.answer()
 
@@ -1690,38 +1814,72 @@ async def open_strength_cb(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(StrengthFSM.choose_category, F.data.startswith("st_cat:"))
-async def strength_choose_cat(cb: CallbackQuery, state: FSMContext):
-    cat = cb.data.split(":", 1)[1]
-    await state.update_data(category=cat)
-    await state.set_state(StrengthFSM.choose_exercise)
+def _truncate_query_for_cb(q: str, max_len: int = 40) -> str:
+    """Telegram callback_data ограничено 64 байтами."""
+    return q.strip()[:max_len]
+
+
+@dp.message(StrengthFSM.search_exercise)
+async def strength_search_exercise(message: Message, state: FSMContext):
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Напиши название упражнения, например: <code>жим</code>")
+        return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        user_id = await db_get_user_id(db, cb.from_user.id)
-        rows = await db_list_exercises(db, user_id, None if cat == "Своя" else cat)
+        user_id = await db_get_user_id(db, message.from_user.id)
+        rows = await db_list_exercises(db, user_id, None)
 
-    rows = rows[:16]
+    matches = _search_exercises(rows, query, limit=5)
     kb = []
-    for r in rows:
-        ex_id, ex_cat, name, is_custom, owner_id = r
-        kb.append([btn(name, f"st_ex:{ex_id}")])
-    kb.append([btn("⬅️ Назад", "strength_add"), btn("❌ Отмена", "go_main_menu", style="danger")])
+    if matches:
+        for r in matches:
+            ex_id, cat, name, is_custom, owner = r
+            kb.append([btn(name, f"st_ex:{ex_id}")])
+        text = (
+            f"🔎 По запросу «<b>{H(query)}</b>» нашёл варианты.\n"
+            "Выбери подходящий или добавь своё."
+        )
+    else:
+        text = (
+            f"🔎 По запросу «<b>{H(query)}</b>» ничего не нашлось.\n"
+            "Попробуй другое слово или сразу добавь своё упражнение."
+        )
+
+    safe_q = _truncate_query_for_cb(query)
+    kb.append([btn(f"➕ Добавить «{safe_q}»", f"st_add_custom:{safe_q}", style="success")])
+    kb.append([btn("⬅️ Назад", "open_strength"), btn("❌ Отмена", "go_main_menu", style="danger")])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("st_add_custom:"))
+async def strength_add_custom(cb: CallbackQuery, state: FSMContext):
+    name = cb.data.split(":", 1)[1].strip()
+    if not name:
+        await cb.answer("Пустое название")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        ex_id = await db_add_custom_exercise(db, user_id, "Своя", name)
+    await state.update_data(exercise_id=ex_id)
+    await state.set_state(StrengthFSM.enter_weight)
     await safe_edit(
         cb.message,
-        f"➕ <b>Новый рекорд</b> · {H(cat)}\n\nШаг 2/4 · выбери упражнение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        f"✅ Добавил «<b>{H(name)}</b>».\n\nТеперь вес (кг), например <code>80</code>:",
+        reply_markup=cancel_fsm_inline(),
     )
     await cb.answer()
 
 
-@dp.callback_query(StrengthFSM.choose_exercise, F.data.startswith("st_ex:"))
+@dp.callback_query(F.data.startswith("st_ex:"))
 async def strength_choose_ex(cb: CallbackQuery, state: FSMContext):
     ex_id = int(cb.data.split(":")[1])
     await state.update_data(exercise_id=ex_id)
     await state.set_state(StrengthFSM.enter_weight)
     await safe_edit(
         cb.message,
-        "➕ <b>Новый рекорд</b>\n\nШаг 3/4 · вес (кг), например <code>80</code>:",
+        "➕ <b>Новый рекорд</b>\n\nВведи вес (кг), например <code>80</code>:",
         reply_markup=cancel_fsm_inline(),
     )
     await cb.answer()
@@ -1960,7 +2118,6 @@ async def ex_del_pick(cb: CallbackQuery, state: FSMContext):
 # -------------------------
 # Workout diary (live mode)
 # -------------------------
-WORKOUT_GROUPS = ["Грудь", "Спина", "Ноги", "Плечи", "Руки", "Полное тело", "Своя"]
 
 @dataclass
 class WorkoutSession:
@@ -1977,22 +2134,23 @@ SESSIONS = {}
 @dp.callback_query(F.data == "workout_start")
 async def workout_start(cb: CallbackQuery, state: FSMContext):
     await state.clear()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        workout_id = await db_workout_create(db, user_id, today_ymd(), "Тренировка")
+
+    SESSIONS[cb.from_user.id] = WorkoutSession(workout_id=workout_id, group="Тренировка")
     await state.set_state(WorkoutFSM.choose_group)
 
-    kb = []
-    row = []
-    for g in WORKOUT_GROUPS:
-        row.append(btn(g, f"wo_g:{g}"))
-        if len(row) == 2:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
-    kb.append([btn("⬅️ Назад", "open_workout"), btn("❌ Отмена", "go_main_menu", style="danger")])
     await safe_edit(
         cb.message,
-        "🏋️ <b>Новая тренировка</b>\n\nКакую группу тренируем?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        "▶️ <b>Тренировка началась!</b>\n\n"
+        "Напиши название упражнения, например:\n"
+        "• <code>жим</code> · <code>присед</code> · <code>тяга</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✅ Завершить тренировку", "wo_finish", style="success")],
+            [btn("❌ Отмена", "go_main_menu", style="danger")],
+        ]),
     )
     await cb.answer()
 
@@ -2007,33 +2165,69 @@ async def open_workout_cb(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.callback_query(WorkoutFSM.choose_group, F.data.startswith("wo_g:"))
-async def wo_choose_group(cb: CallbackQuery, state: FSMContext):
-    group = cb.data.split(":", 1)[1]
-    await state.update_data(workout_group=group)
+@dp.message(WorkoutFSM.choose_group)
+async def wo_search_exercise(message: Message, state: FSMContext):
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Напиши название упражнения, например: <code>жим</code>")
+        return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        user_id = await db_get_user_id(db, cb.from_user.id)
-        workout_id = await db_workout_create(db, user_id, today_ymd(), group)
-        rows = await db_list_exercises(db, user_id, None if group == "Своя" else group)
+        user_id = await db_get_user_id(db, message.from_user.id)
+        rows = await db_list_exercises(db, user_id, None)
 
-    SESSIONS[cb.from_user.id] = WorkoutSession(workout_id=workout_id, group=group)
-    await state.set_state(WorkoutFSM.choose_exercise)
-
+    matches = _search_exercises(rows, query, limit=5)
     kb = []
-    for r in rows[:16]:
-        ex_id, cat, name, is_custom, owner = r
-        kb.append([btn(name, f"wo_ex:{ex_id}")])
+    if matches:
+        for r in matches:
+            ex_id, cat, name, is_custom, owner = r
+            kb.append([btn(name, f"wo_ex:{ex_id}")])
+        text = (
+            f"🔎 По запросу «<b>{H(query)}</b>» нашёл варианты.\n"
+            "Выбери подходящий или добавь своё."
+        )
+    else:
+        text = (
+            f"🔎 По запросу «<b>{H(query)}</b>» ничего не нашлось.\n"
+            "Попробуй другое слово или сразу добавь своё упражнение."
+        )
+
+    safe_q = _truncate_query_for_cb(query)
+    kb.append([btn(f"➕ Добавить «{safe_q}»", f"wo_add_custom:{safe_q}", style="success")])
     kb.append([btn("✅ Завершить тренировку", "wo_finish", style="success")])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+@dp.callback_query(F.data.startswith("wo_add_custom:"))
+async def wo_add_custom(cb: CallbackQuery, state: FSMContext):
+    name = cb.data.split(":", 1)[1].strip()
+    if not name:
+        await cb.answer("Пустое название")
+        return
+    sess = SESSIONS.get(cb.from_user.id)
+    if not sess:
+        await cb.message.answer("Сессия тренировки не найдена. Начни заново.")
+        await cb.answer()
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        user_id = await db_get_user_id(db, cb.from_user.id)
+        ex_id = await db_add_custom_exercise(db, user_id, "Своя", name)
+
+    sess.current_exercise_id = ex_id
+    sess.current_exercise_name = name
+    sess.set_no = 0
+
+    await state.set_state(WorkoutFSM.set_weight)
     await safe_edit(
         cb.message,
-        f"▶️ Тренировка <b>{H(group)}</b> стартовала!\n\nВыбери упражнение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        f"✅ Добавил «<b>{H(name)}</b>».\nПодход <b>1</b> · введи вес (кг):",
+        reply_markup=cancel_fsm_inline(),
     )
     await cb.answer()
 
 
-@dp.callback_query(WorkoutFSM.choose_exercise, F.data.startswith("wo_ex:"))
+@dp.callback_query(F.data.startswith("wo_ex:"))
 async def wo_choose_ex(cb: CallbackQuery, state: FSMContext):
     ex_id = int(cb.data.split(":")[1])
     sess = SESSIONS.get(cb.from_user.id)
@@ -2126,8 +2320,13 @@ async def wo_more_set(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(WorkoutFSM.in_workout, F.data == "wo_end_ex")
 async def wo_end_ex(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(WorkoutFSM.choose_exercise)
-    await cb.message.answer("Упражнение завершено ✅\nВыбери следующее в меню тренировки.")
+    await state.set_state(WorkoutFSM.choose_group)
+    await cb.message.answer(
+        "Упражнение завершено ✅\nНапиши название следующего упражнения, например: <code>тяга</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [btn("✅ Завершить тренировку", "wo_finish", style="success")],
+        ]),
+    )
     await cb.answer()
 
 
